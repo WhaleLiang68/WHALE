@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ELP &#23454;&#39564;&#32467;&#26524;&#24635;&#35272;</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="page-shell">
+    <header class="dashboard-header panel">
+      <div class="dashboard-titlebar">
+        <p class="eyebrow">Experiment Results Dashboard</p>
+        <h1>ELP &#23454;&#39564;&#32467;&#26524;&#24635;&#35272;</h1>
+        <p class="dashboard-subtitle">&#20808;&#31579;&#36873;&#36816;&#34892;&#65292;&#20877;&#26597;&#30475;&#24403;&#21069;&#36873;&#20013;&#36816;&#34892;&#30340;&#25688;&#35201;&#12289;&#39318;&#39029;&#22270;&#34920;&#19982;&#35814;&#32454;&#20998;&#26512;&#12290;</p>
+      </div>
+
+      <div class="dashboard-meta-grid">
+        <div class="dashboard-meta-card">
+          <span class="dashboard-meta-label">&#24403;&#21069;&#25991;&#20214;</span>
+          <strong id="currentFile">&#21152;&#36733;&#20013;...</strong>
+        </div>
+        <div class="dashboard-meta-card">
+          <span class="dashboard-meta-label">&#23454;&#20363;</span>
+          <strong id="currentInstance">-</strong>
+        </div>
+        <div class="dashboard-meta-card">
+          <span class="dashboard-meta-label">&#31639;&#27861;</span>
+          <strong id="currentAlgorithm">-</strong>
+        </div>
+        <div class="dashboard-meta-card">
+          <span class="dashboard-meta-label">&#24403;&#21069;&#35270;&#22270;</span>
+          <strong id="currentViewMode">-</strong>
+        </div>
+        <div class="dashboard-meta-actions">
+          <button id="refreshButton" class="primary-button" type="button">&#21047;&#26032;&#25968;&#25454;</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="statusBanner" class="status-banner hidden"></div>
+
+    <section class="workspace-grid">
+      <article class="panel explorer-panel">
+        <div class="panel-header compact-panel-header">
+          <div>
+            <h2 id="tablePanelTitle">&#36816;&#34892;&#26126;&#32454;&#24037;&#20316;&#21488;</h2>
+            <p id="tableMeta">&#27491;&#22312;&#21152;&#36733;...</p>
+          </div>
+        </div>
+
+        <section class="toolbar panel toolbar-compact toolbar-embedded">
+          <div class="control">
+            <label for="fileSelect">&#32467;&#26524;&#25991;&#20214;</label>
+            <select id="fileSelect"></select>
+          </div>
+
+          <div class="control control-wide">
+            <label for="searchInput">&#20851;&#38190;&#35789;</label>
+            <input id="searchInput" type="search" placeholder="&#25628;&#32034;&#23454;&#20363;&#12289;&#31639;&#27861;&#12289;&#22791;&#27880;..." />
+          </div>
+
+          <div class="control">
+            <label for="validityFilter">&#23485;&#39640;&#27604;&#29366;&#24577;</label>
+            <select id="validityFilter">
+              <option value="all">&#20840;&#37096;</option>
+              <option value="true">&#28385;&#36275;</option>
+              <option value="false">&#19981;&#28385;&#36275;</option>
+              <option value="unknown">&#26410;&#30693;</option>
+            </select>
+          </div>
+
+          <div class="control">
+            <label for="dateFilter">&#26085;&#26399;&#31579;&#36873;</label>
+            <select id="dateFilter">
+              <option value="all">&#20840;&#37096;&#26085;&#26399;</option>
+            </select>
+          </div>
+
+          <div class="control">
+            <label for="remarkFilter">&#22791;&#27880;&#31579;&#36873;</label>
+            <select id="remarkFilter">
+              <option value="all">&#20840;&#37096;&#22791;&#27880;</option>
+            </select>
+          </div>
+
+          <div class="control">
+            <label for="runRange">&#26368;&#36817; N &#26465;</label>
+            <select id="runRange">
+              <option value="all">&#20840;&#37096;</option>
+              <option value="20">&#26368;&#36817; 20 &#26465;</option>
+              <option value="50">&#26368;&#36817; 50 &#26465;</option>
+              <option value="100">&#26368;&#36817; 100 &#26465;</option>
+            </select>
+          </div>
+
+          <div class="toolbar-actions">
+            <button id="resetFilters" class="ghost-button" type="button">&#37325;&#32622;&#31579;&#36873;</button>
+          </div>
+        </section>
+
+        <div id="resultsTable" class="table-host workbench-table"></div>
+      </article>
+
+      <article class="panel focus-panel">
+        <div class="panel-header compact-panel-header">
+          <div>
+            <h2 id="focusPanelTitle">&#36873;&#20013;&#36816;&#34892;&#25688;&#35201;</h2>
+            <p id="focusPanelSubtitle">&#21491;&#20391;&#22987;&#32456;&#36319;&#38543;&#24403;&#21069;&#36873;&#20013;&#36816;&#34892;&#65292;&#24110;&#21161;&#24555;&#36895;&#29702;&#35299;&#32467;&#26524;&#12290;</p>
+          </div>
+        </div>
+
+        <section id="summaryCards" class="summary-grid summary-grid-compact"></section>
+
+        <section class="chart-grid home-chart-grid">
+          <article class="panel chart-panel compact-chart-panel">
+            <div class="panel-header">
+              <div>
+                <h3 id="chartPanel1Title">&#27010;&#35272;&#22270; A</h3>
+                <p id="chartPanel1Subtitle">&#22270;&#34920;&#20250;&#26681;&#25454;&#24403;&#21069;&#36816;&#34892;&#27169;&#24335;&#33258;&#21160;&#20999;&#25442;&#12290;</p>
+              </div>
+            </div>
+            <div id="fitnessChart" class="chart-canvas chart-canvas-compact"></div>
+          </article>
+
+          <article class="panel chart-panel compact-chart-panel">
+            <div class="panel-header">
+              <div>
+                <h3 id="chartPanel2Title">&#27010;&#35272;&#22270; B</h3>
+                <p id="chartPanel2Subtitle">&#22270;&#34920;&#20250;&#26681;&#25454;&#24403;&#21069;&#36816;&#34892;&#27169;&#24335;&#33258;&#21160;&#20999;&#25442;&#12290;</p>
+              </div>
+            </div>
+            <div id="timingChart" class="chart-canvas chart-canvas-compact"></div>
+          </article>
+        </section>
+      </article>
+    </section>
+
+    <section class="panel detail-workspace">
+      <div class="panel-header compact-panel-header">
+        <div>
+          <h2 id="detailPanelTitle">&#36816;&#34892;&#35814;&#24773;</h2>
+          <p id="detailPanelSubtitle">&#36890;&#36807;&#26631;&#31614;&#39029;&#26597;&#30475;&#27010;&#35272;&#12289;Pareto&#12289;&#24067;&#23616;&#12289;&#20998;&#26512;&#19982;&#22791;&#27880;&#12290;</p>
+        </div>
+      </div>
+      <div id="detailContent" class="detail-content">
+        <div class="empty-state">&#35831;&#20808;&#20174;&#24038;&#20391;&#34920;&#26684;&#36873;&#25321;&#19968;&#26465;&#36816;&#34892;&#35760;&#24405;&#12290;</div>
+      </div>
+    </section>
+
+    <details class="panel tool-disclosure">
+      <summary class="tool-disclosure-summary">
+        <div>
+          <strong>&#24067;&#23616;&#22270;&#29983;&#25104;&#22120;&#65288;&#24037;&#20855;&#65289;</strong>
+          <span>&#40664;&#35748;&#25910;&#36215;&#12290;&#20808;&#30475;&#32467;&#26524;&#65292;&#20877;&#25353;&#38656;&#29983;&#25104;&#25110;&#23548;&#20986;&#24067;&#23616;&#22270;&#12290;</span>
+        </div>
+      </summary>
+
+      <section class="layout-studio layout-studio-body">
+        <div class="panel-header compact-panel-header">
+          <div>
+            <h2>&#24067;&#23616;&#22270;&#29983;&#25104;&#22120;</h2>
+            <p>&#25903;&#25345;&#20174;&#24403;&#21069;&#36816;&#34892;&#12289;&#25991;&#26723;&#25552;&#21462;&#32467;&#26524;&#25110;&#25163;&#21160;&#36755;&#20837;&#35299;&#29983;&#25104;&#24067;&#23616;&#12290;</p>
+          </div>
+        </div>
+
+        <div class="studio-grid">
+          <div class="studio-controls">
+            <div class="control">
+              <label for="instanceSelect">&#23454;&#20363;</label>
+              <select id="instanceSelect"></select>
+            </div>
+
+            <div class="studio-actions inline">
+              <button id="generateFromRunButton" class="primary-button" type="button">&#20174;&#24403;&#21069;&#36816;&#34892;&#29983;&#25104;</button>
+            </div>
+
+            <div class="control">
+              <label for="docPathInput">&#25991;&#26723;&#25110;&#25991;&#26412;&#36335;&#24452;</label>
+              <input id="docPathInput" type="text" placeholder="docs/tmp_solution.txt &#25110; docs/xxx.docx" />
+            </div>
+
+            <div class="studio-row">
+              <div class="control">
+                <label for="extractIndexInput">&#25552;&#21462;&#32034;&#24341;</label>
+                <input id="extractIndexInput" type="number" min="0" step="1" value="0" />
+              </div>
+              <div class="studio-actions">
+                <button id="generateFromDocButton" class="ghost-button" type="button">&#20174;&#25991;&#26723;&#25552;&#21462;</button>
+              </div>
+            </div>
+
+            <div class="control">
+              <label for="manualSolutionInput">&#25163;&#21160;&#36755;&#20837;&#35299;</label>
+              <textarea
+                id="manualSolutionInput"
+                rows="6"
+                placeholder="&#20363;&#22914; [[1,2,3,4],[5,6,7,8]] &#25110; [array([1,2,3]), array([4,5,6])]"
+              ></textarea>
+            </div>
+
+            <div class="studio-actions">
+              <button id="generateManualButton" class="primary-button" type="button">&#29983;&#25104;&#24067;&#23616;</button>
+              <button id="clearManualButton" class="ghost-button" type="button">&#28165;&#31354;</button>
+            </div>
+
+            <p class="studio-hint">
+              &#22914;&#26524; CSV &#20013;&#24050;&#26377;&#36816;&#34892;&#32467;&#26524;&#65292;&#20248;&#20808;&#20351;&#29992;&#8220;&#20174;&#24403;&#21069;&#36816;&#34892;&#29983;&#25104;&#8221;&#20197;&#20445;&#25345;&#19982;&#35760;&#24405;&#19968;&#33268;&#12290;
+            </p>
+          </div>
+
+          <div class="studio-preview">
+            <div id="generatorMeta" class="solution-layout-meta"></div>
+            <div id="generatorLayoutHost" class="solution-layout-host">
+              <div class="solution-layout-loading">&#31561;&#24453;&#29983;&#25104;&#24067;&#23616;...</div>
+            </div>
+            <div class="studio-actions">
+              <button id="downloadSvgButton" class="ghost-button" type="button">&#23548;&#20986; SVG</button>
+              <button id="downloadPngButton" class="ghost-button" type="button">&#23548;&#20986; PNG</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </details>
+  </div>
+
+  <div id="chartTooltip" class="tooltip hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
