@@ -1,0 +1,25 @@
+﻿{
+  "main_name": "大数据驱动不等面积设施布局智能优化系统 V1.0",
+  "alternate_names": [
+    "不等面积设施布局大数据智能优化系统 V1.0",
+    "面向不等面积设施布局的大数据优化求解系统 V1.0"
+  ],
+  "subtitle": "基于势能曲面变平法（ELP）的优化求解方法",
+  "abstract_first_sentence": "本软件面向不等面积设施布局问题，融合大数据特征建模与势能曲面变平法实现高效优化求解。",
+  "keywords": [
+    "大数据",
+    "不等面积设施布局",
+    "智能优化",
+    "势能曲面变平法",
+    "ELP"
+  ],
+  "version": "V1.0",
+  "scope": "ELP + 关键依赖模块",
+  "registration_profile": "中国大陆软著口径，个人主体",
+  "check_targets": [
+    "README.md",
+    "docs/softcopyright/01_申请表-命名信息.md",
+    "docs/softcopyright/02_软件说明书-模板.md",
+    "docs/softcopyright/03_源代码文档封面-模板.md"
+  ]
+}

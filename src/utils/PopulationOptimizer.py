@@ -80,12 +80,18 @@ class PopulationOptimizer:
             return selected
         elif selection_type == "roulette":
             # 轮盘赌选择（适应度越小权重越高，需做映射）
-            fitnesses = [self.evaluate_individual(ind) for ind in self.population]
-            # 转为最大值问题（适应度越小，权重越高）
-            max_fitness = max(fitnesses)
-            weights = [max_fitness - f + 1e-6 for f in fitnesses]  # 避免为0
-            weights = np.array(weights) / sum(weights)  # 归一化
-            # 生成带权重的随机索引（基于种群长度和权重）
+            fitnesses = np.asarray([self.evaluate_individual(ind) for ind in self.population], dtype=float)
+            finite_mask = np.isfinite(fitnesses)
+            if not np.any(finite_mask):
+                indices = np.random.choice(len(self.population), self.pop_size, replace=True)
+                return [self.population[i] for i in indices]
+            max_fitness = np.max(fitnesses[finite_mask])
+            weights = np.where(finite_mask, max_fitness - fitnesses + 1e-6, 1e-6)
+            weight_sum = float(np.sum(weights))
+            if (not np.isfinite(weight_sum)) or weight_sum <= 0:
+                indices = np.random.choice(len(self.population), self.pop_size, replace=True)
+                return [self.population[i] for i in indices]
+            weights = weights / weight_sum
             indices = np.random.choice(len(self.population), self.pop_size, p=weights, replace=True)
             # 根据索引获取选中的个体
             selected = [self.population[i] for i in indices]
@@ -223,7 +229,7 @@ class PopulationOptimizer:
             current_best_fitness = current_fitnesses[current_best_idx]
 
             # 更新全局最优
-            if current_best_fitness < self.best_fitness:
+            if self.best_individual is None or current_best_fitness < self.best_fitness:
                 self.best_fitness = current_best_fitness
                 self.best_individual = current_best
                 # 确保bay的最后一个元素为1
@@ -262,7 +268,7 @@ if __name__ == "__main__":
 
     # 3. 用种群优化的最优解初始化强化学习环境
     env.reset(fbs_model=best_initial_layout)
-    print("强化学习环境已用最优解初始化")
+    print("??????????????")
     env.render()
 
     # 4. 后续强化学习训练逻辑（示例）

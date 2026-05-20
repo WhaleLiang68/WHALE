@@ -1,53 +1,94 @@
-import sys
+﻿import copy
 import pickle
+import sys
 import uuid
+from typing import Any, Dict, Optional
+
 import gym
-from gym import spaces
-import matplotlib
-from matplotlib import pyplot as plt
-from matplotlib import patches
 import numpy as np
+from gym import spaces
 from loguru import logger
-from typing import Optional, Dict, Any
+from matplotlib import patches
+from matplotlib import pyplot as plt
+
+import src.utils.FBSUtil as FBSUtil
 import src.utils.config as config
 from src.utils.FBSModel import FBSModel
-import src.utils.FBSUtil as FBSUtil
-# from src.utils.warnings_config import setup_warnings
 
-# # 设置警告过滤器
-# setup_warnings()
-
-# 设置日志处理级别
 logger.remove()
-logger.add(
-    sys.stderr,
-    level="INFO"
-)
-plt.rcParams["axes.unicode_minus"] = False  # 正常显示负号
+logger.add(sys.stderr, level="INFO")
+plt.rcParams["axes.unicode_minus"] = False
 
-# 继承 gym.Env 并整合 DataExtractor
+# === 新增：标准测试实例的长宽比（Aspect Ratio）官方映射库 ===
+STANDARD_ASPECT_RATIOS = {
+    # O 系列 (Meller et al.)
+    'O7': 4.0, 'O8': 4.0, 'O9': 5.0,
+    'O10': 5.0, 'O12': 5.0,
+
+    # VC 系列 (Van Camp et al.)
+    'VC10': 5.0,
+
+    # FO / F / D 系列
+    'FO7': 4.0, 'FO8': 4.0, 'FO9': 4.0,
+    'FO10': 3.0, 'F10': 3.0, 'FO11': 4.0,
+    'D6': 4.0, 'D8': 4.0, 'D10': 4.0, 'D12': 4.0,
+
+    # BA / MB 系列 (Bazaraa / Bozer & Meller)
+    # 注：BA原论文为最小边长约束，转化为长宽比时学界常放宽为 4.0 或 5.0
+    'BA12': 5.0, 'BA14': 5.0, 'MB12': 4.0,
+
+    # SC 系列 (Liu & Meller)
+    'SC30': 5.0, 'SC35': 4.0,
+
+    # Du 系列 (Dunker et al.)
+    'Du62': 4.0,
+
+    # TAM 系列 (Tam)
+    'TAM20': 5.0, 'TAM30': 5.0,
+
+    # 其他常见算例通用默认约束
+    'BME15': 4.0, 'AEG20': 4.0, 'AML4': 4.0,
+}
+
+
+def patch_aspect_ratio(instance_name: str, original_limit: float) -> float:
+    """
+    智能修正实例的长宽比上限。
+    处理逻辑：
+    1. 自动解析名称后缀 (如 AB20-ar3 -> 3.0)
+    2. 匹配官方字典库
+    3. 去除自定义后缀 (如 -maoyan) 后再次匹配
+    4. 若原数据缺失(如 99.0)，则提供通用备用值 5.0
+    """
+    import re
+    # 1. 尝试从实例名称中自动提取 (匹配 -ar3, -ar50 等)
+    ar_match = re.search(r'-ar(\d+)', instance_name.lower())
+    if ar_match:
+        return float(ar_match.group(1))
+
+    # 去除可能存在的后缀，提取核心算例名
+    base_name = instance_name.replace('-maoyan', '')
+
+    # 2 & 3. 尝试从硬编码的标准字典中匹配
+    if base_name in STANDARD_ASPECT_RATIOS:
+        return STANDARD_ASPECT_RATIOS[base_name]
+    if instance_name in STANDARD_ASPECT_RATIOS:
+        return STANDARD_ASPECT_RATIOS[instance_name]
+
+    # 4. 如果原数据是 99.0 且字典里找不到，赋予通用默认值 5.0
+    if original_limit == 99.0 or original_limit > 50.0:
+        logger.warning(f"实例 {instance_name} 未在 pkl 或字典中找到长宽比，采用默认值 5.0")
+        return 5.0
+
+    return original_limit
+
+
+# ========================================================
+
 class DataProcessingEnv(gym.Env):
     def __init__(self, instance=None, seed=None, options=None):
-        super(DataProcessingEnv, self).__init__()  # 调用父类初始化
-
-        # with open(config.FILE_PATH, "rb") as file:
-        #     data = pickle.load(file)
-        #     # 打印数据结构
-        #     print("Loaded data types:", [type(d) for d in data])
-        #     print("FlowMatrices keys:", data[1].keys() if isinstance(data[1], dict) else "Not a dict")
-        #     (
-        #         self.problems,
-        #         self.FlowMatrices,
-        #         self.sizes,
-        #         self.LayoutWidths,
-        #         self.LayoutLengths,
-        #     ) = data
-
-        # 从 .pkl 文件中加载预定义的设施布局问题数据
-        with open(
-                config.FILE_PATH,
-                "rb",
-        ) as file:
+        super().__init__()
+        with open(config.FILE_PATH, "rb") as file:
             (
                 self.problems,
                 self.FlowMatrices,
@@ -55,420 +96,384 @@ class DataProcessingEnv(gym.Env):
                 self.LayoutWidths,
                 self.LayoutLengths,
             ) = pickle.load(file)
-        # 初始化实例，环境初始化过程中的基础操作
+
         self.instance = instance
-        # 检查 instance 是否在数据中
-        if self.instance not in self.problems:
-            print(f"Error: Instance {self.instance} not found in problems data.")
-        # 检查实例是否存在
-        if instance not in self.FlowMatrices or instance not in self.problems:
+        if self.instance not in self.problems or self.instance not in self.FlowMatrices:
             valid_instances = list(self.FlowMatrices.keys())
-            raise ValueError(f"实例 '{instance}' 不存在。可用实例: {valid_instances}")
+            raise ValueError(f"Instance '{instance}' not found. Valid instances: {valid_instances}")
+
         self.uuid = uuid.uuid4()
-        # 获取问题模型的设施数量
-        # self.F = self.FlowMatrices[self.instance]  # 物流强度矩阵
-        raw_F = self.FlowMatrices[self.instance]
-        # 将上三角矩阵转换为对称矩阵：F = F + F.T
-        # 注意：这里假设对角线为0（设施对自己没有物流）。如果对角线不为0，需要减去一次对角线。
-        self.F = raw_F + raw_F.T
-        # print("检查流矩阵对称性：")
-        # print(self.F)
-        self.n = self.problems[self.instance]  # 问题模型的设施数量
-        self.areas,self.fac_limit_aspect = (
-            FBSUtil.getAreaData(self.sizes[self.instance])
-        )  # 面积，横纵比
-        logger.debug(f"横纵比: {self.fac_limit_aspect}")
-        logger.debug(f"面积: {self.areas}")
-        self.H = self.LayoutWidths[self.instance]  # 厂房的长度
-        self.W = self.LayoutLengths[self.instance]  # 厂房的宽度
-        # self.fbs_model = None
-        total_area = np.sum(self.areas)  # 设施的总面积
-        self.actions = { # 一个字典，定义了动作编号与动作名称的映射
+        raw_F = np.asarray(self.FlowMatrices[self.instance])
+        # Du62 保持原始物流量矩阵，不做对称补全。
+        if self.instance == "Du62":
+            self.F = raw_F.copy()
+        elif np.allclose(np.tril(raw_F, -1), 0):
+            self.F = raw_F + raw_F.T - np.diag(np.diag(raw_F))
+        else:
+            self.F = raw_F.copy()
+        self.n = self.problems[self.instance]
+        # self.areas, self.aspect_limits = FBSUtil.getAreaData(self.sizes[self.instance])
+        # self.fac_limit_aspect = FBSUtil.get_instance_aspect_limit(self.aspect_limits)
+        # 1. 读取原始数据
+        self.areas, self.aspect_limits = FBSUtil.getAreaData(self.sizes[self.instance])
+        self.fac_limit_aspect = FBSUtil.get_instance_aspect_limit(self.aspect_limits)
+
+        # 2. ==== 调用补丁，强行覆写缺失的长宽比 ====
+        self.fac_limit_aspect = patch_aspect_ratio(self.instance, self.fac_limit_aspect)
+
+        # 3. 同步修复数组形式的 aspect_limits（防止内部向量化计算时仍然使用 99.0）
+        if isinstance(self.aspect_limits, np.ndarray):
+            # 将数组内所有异常值(99.0)替换为正确的修正值
+            self.aspect_limits[self.aspect_limits > 50.0] = self.fac_limit_aspect
+        else:
+            self.aspect_limits = np.full(self.n, self.fac_limit_aspect, dtype=float)
+
+        self.H = self.LayoutWidths[self.instance]
+        self.W = self.LayoutLengths[self.instance]
+
+        self.actions = {
             0: "facility_swap",
             1: "bay_flip",
             2: "bay_swap",
             3: "repair",
-            4: "idle",#什么也不做
+            4: "idle",
             5: "facility_insert",
             6: "bay_shuffle",
             7: "facility_shuffle",
-            8: "ga_action"
-        }  # 动作空间
-        self.action_space = spaces.Discrete(len(self.actions))  # 动作空间，创建一个离散空间，表示智能体可以选择的动作编号为 0 到 4
-        # spaces.Box 表示连续的多维状态空间/low=0, high=255：状态中每个元素的最小值和最大值（类似 RGB 颜色的取值范围）
-        """""
-        shape = (self.n * 3,)：
-        self.n是设施数量。
-        每个设施用3个值表示（例如：坐标(x, y)和成本cost，或其他特征）。
-        因此总维度为n * 3。
-        """""
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.n * 3,), dtype=np.float64)  # 状态空间
-        self.fitness = np.inf
-        self.best_fitness = np.inf
-        # 惩罚指数控制：从1逐步升至3
-        self.penalty_k_min = 1.0
-        self.penalty_k_max = 5.0
-        self.penalty_k_growth = 1.001
-        self.penalty_k = self.penalty_k_min
-
-        # ------------------调试信息------------------
-        logger.debug("-------------------init初始化信息------------------")
-        logger.debug(f"实例: {self.instance}")
-        logger.debug(f"设施数量: {self.n}")
-        logger.debug(f"设施信息: {self.sizes[self.instance]}")
-        logger.debug(f"设施面积: {self.areas}")
-        logger.debug(f"设施横纵比: {self.fac_limit_aspect}")
-        logger.debug(f"设施总长度H: {self.H}")
-        logger.debug(f"设施总宽度W: {self.W}")
-        logger.debug("--------------------------------------------------")
+            8: "ga_action",
+            9: "flow_guided_swap",
+            10: "segment_insert",
+            11: "cross_bay_relocate",
+            12: "bay_split_by_flow",
+            13: "bay_merge_by_flow",
+            14: "adjacent_bay_repartition_by_flow",
+            15: "adjacent_bay_block_repartition_by_flow",
+        }
+        self.action_space = spaces.Discrete(len(self.actions))
+        self.observation_space = spaces.Box(
+            low=0,
+            high=255,
+            shape=(self.n * 3,),
+            dtype=np.float64,
+        )
+        self.distance_metric = "manhattan"
+        self.k_penalty = 1
+        self._clear_runtime_tracking()
 
     def __getstate__(self):
-       """
-       为 deepcopy 和 pickle 提供指导，告诉它们哪些状态需要保存。
-       我们返回包含所有可安全复制属性的字典。
-       """
-       # self.__dict__ 包含了类的所有实例属性
-       return self.__dict__
+        return self.__dict__
 
     def __setstate__(self, state):
-       """
-       为 deepcopy 和 pickle 提供指导，告诉它们如何根据状态重建对象。
-       """
-       # 将保存的状态字典更新回实例的 __dict__ 中
-       self.__dict__.update(state)
+        self.__dict__.update(state)
 
-   # 将环境重置到初始状态，为新一轮训练或测试做准备
+    def _clear_runtime_tracking(self):
+        self.fbs_model = None
+        self.fac_x = np.zeros(self.n, dtype=float)
+        self.fac_y = np.zeros(self.n, dtype=float)
+        self.fac_b = np.zeros(self.n, dtype=float)
+        self.fac_h = np.zeros(self.n, dtype=float)
+        self.fac_aspect_ratio = np.zeros(self.n, dtype=float)
+        self.lower_bounds = np.zeros(self.n, dtype=float)
+        self.upper_bounds = np.zeros(self.n, dtype=float)
+        self.infeasible_mask = np.zeros(self.n, dtype=bool)
+        self.D = np.zeros((self.n, self.n), dtype=float)
+        self.TM = np.zeros((self.n, self.n), dtype=float)
+        self.MHC = np.inf
+        self.fitness = np.inf
+        self.best_fitness = np.inf
+        self.best_MHC = np.inf
+        self.previous_fitness = np.inf
+        self.previous_MHC = np.inf
+        self.previous_d_inf = self.n
+        self.current_d_inf = self.n
+        self.current_is_feasible = False
+        self.current_v_worst = None
+        self.feasible_solution_count = 0
+        self.best_feasible_cost = np.inf
+        self.worst_feasible_cost = None
+        self.best_feasible_solution = None
+        self.state = np.zeros(self.n * 3, dtype=float)
+
+    def _runtime_v_worst(self):
+        if self.worst_feasible_cost is None or not np.isfinite(self.worst_feasible_cost):
+            return None
+        return float(self.worst_feasible_cost)
+
+    def _register_feasible_solution(self, cost: float, snapshot: Optional[FBSModel] = None):
+        if not np.isfinite(cost):
+            return
+        self.feasible_solution_count += 1
+        if snapshot is not None and cost < self.best_feasible_cost:
+            self.best_feasible_solution = copy.deepcopy(snapshot)
+        if cost < self.best_feasible_cost:
+            self.best_feasible_cost = float(cost)
+        if self.worst_feasible_cost is None:
+            self.worst_feasible_cost = float(cost)
+        else:
+            self.worst_feasible_cost = max(float(self.worst_feasible_cost), float(cost))
+        self.best_fitness = self.best_feasible_cost
+        self.current_v_worst = self._runtime_v_worst()
+
+    def _sync_metrics(self, metrics: Dict[str, Any]):
+        self.fac_x = metrics["fac_x"]
+        self.fac_y = metrics["fac_y"]
+        self.fac_b = metrics["fac_b"]
+        self.fac_h = metrics["fac_h"]
+        self.fac_aspect_ratio = metrics["fac_aspect_ratio"]
+        self.lower_bounds = metrics["lower_bounds"]
+        self.upper_bounds = metrics["upper_bounds"]
+        self.infeasible_mask = metrics["infeasible_mask"]
+        self.D = metrics["D"]
+        self.TM = metrics["TM"]
+        self.MHC = metrics["mhc"]
+        self.fitness = metrics["cost"]
+        self.current_d_inf = metrics["d_inf"]
+        self.current_is_feasible = metrics["is_feasible"]
+        self.current_v_worst = metrics["v_worst"]
+
+    def _evaluate_current_layout(self, snapshot_best: bool = True) -> Dict[str, Any]:
+        metrics = FBSUtil.evaluate_layout(
+            self.fbs_model,
+            self.areas,
+            self.H,
+            self.F,
+            self.aspect_limits,
+            v_worst=self._runtime_v_worst(),
+            k_penalty=self.k_penalty,
+            distance_metric=self.distance_metric,
+        )
+        self._sync_metrics(metrics)
+        if metrics["is_feasible"]:
+            snapshot = self.fbs_model if snapshot_best else None
+            self._register_feasible_solution(metrics["cost"], snapshot=snapshot)
+            self.fitness = metrics["cost"]
+        else:
+            self.current_v_worst = self._runtime_v_worst()
+        self.best_MHC = min(self.best_MHC, self.MHC)
+        return metrics
+
+    def _make_initial_model(self) -> FBSModel:
+        B = FBSUtil.select_B(self.areas, self.n, self.fac_limit_aspect, self.W)
+        if B is None:
+            B = 2
+        genes, permutation = FBSUtil.ZGeneCoding.generate_genes(self.n, B)
+        bay_list, bay = FBSUtil.ZGeneCoding.decode_genes(genes, permutation)
+        permutation, bay = FBSUtil.arrayToPermutation(bay_list)
+        bay[-1] = 1
+        return FBSModel(
+            permutation.astype(int).tolist(),
+            bay.astype(int).tolist(),
+            genes=genes.tolist() if isinstance(genes, np.ndarray) else genes,
+        )
+
     def reset(self, seed=None, options=None, fbs_model: FBSModel = None):
         if seed is not None:
-            np.random.seed(seed)  # 设置随机种子
+            np.random.seed(seed)
         if options is not None and "fbs_model" in options:
             fbs_model = options["fbs_model"]
-        self.penalty_k = self.penalty_k_min
-        # if fbs_model is not None:
-            # print(f"reset() 收到的fbs_model内存地址: {id(fbs_model)}")
-            # print(f"reset() 收到传入的fbs_model: {fbs_model}")
-        # else:
-        #     print("reset() 未收到fbs_model（使用默认逻辑）")
-        # 重置环境，生成初始解
-        if fbs_model is None:
-            # 如果fbs_model为None，则随机生成初始解
-            # 初始解生成
-            # ----------基因编码方式-------------------
-            B=FBSUtil.select_B(self.areas, self.n, self.fac_limit_aspect, self.W)
-            if B is None:
-                # 处理没有可行B的情况，例如使用默认值
-                B = 2
-                print(f"没有找到可行的区带总数，使用默认值 B={B}")
-            genes, permutation = FBSUtil.ZGeneCoding.generate_genes(self.n, B)
-            # print(genes)
-            bay_list, bay = FBSUtil.ZGeneCoding.decode_genes(genes, permutation)
-            permutation, bay = FBSUtil.arrayToPermutation(bay_list)
-            # ---------------------------------------
-            # permutation, bay = FBSUtil.binary_solution_generator(self.areas, self.n, self.fac_limit_aspect, self.W)  # 采用k分初始解生成器
-            # permutation,bay = FBSUtil.random_solution_generator(self.n) # 采用随机初始解生成器
-            bay[-1] = 1  # bay的最后一个位置必须是1，表示最后一个设施是bay的结束
-            self.fbs_model = FBSModel(
-                permutation.astype(int).tolist(),
-                bay.astype(int).tolist(),
-                genes=genes.tolist() if isinstance(genes, np.ndarray) else genes
-            )
 
-        else:
-            # 如果fbs_model不为None，则使用传入的fbs_model
-            logger.debug(
-                f"传入的fbs_model: permutation={self.fbs_model.permutation}, bay={self.fbs_model.bay}, genes={self.fbs_model.genes}")
-            self.fbs_model = fbs_model
-        (
-            self.fac_x,
-            self.fac_y,
-            self.fac_h,
-            self.fac_b,
-            self.fac_aspect_ratio,
-            self.D,
-            self.TM,
-            self.MHC,
-            self.fitness,
-        # ) = FBSUtil.StatusUpdatingDevice(self.fbs_model, self.areas, self.H,
-        #                                  self.F, self.fac_limit_aspect) 
-        ) = FBSUtil.StatusUpdatingDevice2(
-            self.fbs_model,
-            self.areas,
-            self.H,
-            self.F,
-            self.fac_limit_aspect,
-            g_best=self.best_fitness,
-            penalty_k=self.penalty_k,
-        )  
-        self.penalty_k = min(
-            self.penalty_k * self.penalty_k_growth, self.penalty_k_max
-        )
-        self.best_MHC = self.MHC                                   
-        self.previous_fitness = self.fitness  # 初始化上一次的适应度值
-        # 更新状态字典
+        self._clear_runtime_tracking()
+        self.fbs_model = copy.deepcopy(fbs_model) if fbs_model is not None else self._make_initial_model()
+        self._evaluate_current_layout(snapshot_best=True)
+        self.previous_fitness = self.fitness
+        self.previous_MHC = self.MHC
+        self.previous_d_inf = self.current_d_inf
         self.state = self.constructState()
-        logger.debug("-------------------reset调试信息------------------")
-        logger.debug(f"设施x坐标: {self.fac_x}")
-        logger.debug(f"设施y坐标: {self.fac_y}")
-        logger.debug(f"设施宽度: {self.fac_b}")
-        logger.debug(f"设施高度: {self.fac_h}")
-        logger.debug(f"设施横纵比: {self.fac_aspect_ratio}")
-        logger.debug(f"设施距离矩阵: {self.D}")
-        logger.debug(f"设施移动矩阵: {self.TM}")
-        logger.debug(f"设施移动矩阵: {self.MHC}")
-        logger.debug(f"设施适应度: {self.fitness}")
-        logger.debug(f"状态: {self.state}")
-        logger.debug("--------------------------------------------------")
-        
-        # 创建info字典
         info = {
             "fitness": self.fitness,
-            "facility_count": self.n,
-            "layout_dimensions": (self.H, self.W),
-            "instance": self.instance
+            "mhc": self.MHC,
+            "d_inf": self.current_d_inf,
+            "is_feasible": self.current_is_feasible,
         }
-        
         return self.state, info
 
-    def calculate_reward_1(self):
-        # 计算MHC改善程度
-        # mhc_improvement = ((self.previous_MHC - self.MHC) /
-        #                    self.previous_MHC if self.previous_MHC else 0)
-
-        # 计算约束违反惩罚
-        # aspect_ratio_penalty = sum(
-        #     max(0, ar - self.fac_limit_aspect) +
-        #     max(0, self.fac_limit_aspect - ar) for ar in self.fac_aspect_ratio)
-
-        # 计算fitness改善程度
-        fitness_improvement = ((self.previous_fitness - self.fitness) /
-                               self.fitness if self.previous_fitness else 0)
-
-        # # 综合奖励计算
-        reward = (
-            # 0.4 * mhc_improvement  # MHC改善权重
-                1 * fitness_improvement  # 整体fitness改善权重
-            # + 0.2 * aspect_ratio_penalty  # 约束违反惩罚权重
-        )
-        # reward = -self.fitness
-        # 适应度和MHC的惩罚
-        # reward = self.MHC - self.fitness
-        return reward
-
-    def calculate_reward_2(self):
-        return -self.fitness
-
-    def step(self, action):
-        # 根据action执行相应的操作
-        action_name = self.actions[int(action)]
-        
-        # 保存操作前的状态用于调试
-        old_perm_len = len(self.fbs_model.permutation) if self.fbs_model.permutation else 0
-        old_bay_len = len(self.fbs_model.bay) if self.fbs_model.bay else 0
-        
-        # if action_name == "facility_swap_single":
-        # self.fbs_model.permutation, self.fbs_model.bay = (
-        #     FBSUtil.facility_swap_single(self.fbs_model.permutation,
-        #                                  self.fbs_model.bay))
-        # elif action_name == "shuffle_single":
-        # self.fbs_model.permutation, self.fbs_model.bay = FBSUtil.shuffle_single(
-        # self.fbs_model.permutation, self.fbs_model.Xbay)
+    def _apply_action(self, action_name: str):
         if action_name == "facility_swap":
             new_perm, new_bay = FBSUtil.facility_swap(
-                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay))
-            # 确保转换为列表并检查长度
-            if len(new_perm) > 0 and len(new_bay) > 0:
-                self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-                self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            else:
-                logger.error(f"facility_swap 返回空数组: perm_len={len(new_perm)}, bay_len={len(new_bay)}")
+                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay)
+            )
         elif action_name == "bay_flip":
             new_perm, new_bay = FBSUtil.bay_flip(
-                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay))
-            if len(new_perm) > 0 and len(new_bay) > 0:
-                self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-                self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            else:
-                logger.error(f"bay_flip 返回空数组: perm_len={len(new_perm)}, bay_len={len(new_bay)}")
+                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay)
+            )
         elif action_name == "bay_swap":
             new_perm, new_bay = FBSUtil.bay_swap(
-                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay))
-            if len(new_perm) > 0 and len(new_bay) > 0:
-                self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-                self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            else:
-                logger.error(f"bay_swap 返回空数组: perm_len={len(new_perm)}, bay_len={len(new_bay)}")
-        elif action_name == "bay_shuffle":
-            new_perm, new_bay = FBSUtil.bay_shuffle(
-                self.fbs_model.permutation, self.fbs_model.bay)
-            self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-            self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-
-        elif action_name == "facility_shuffle":
-            new_perm, new_bay = FBSUtil.facility_shuffle(
-                self.fbs_model.permutation, self.fbs_model.bay)
-            self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-            self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            # elif action_name == "permutation_shuffle":
-            #     self.fbs_model.permutation, self.fbs_model.bay = (
-            #         FBSUtil.permutation_shuffle(self.fbs_model.permutation,
-            #                                     self.fbs_model.bay))
+                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay)
+            )
         elif action_name == "repair":
             new_perm, new_bay = FBSUtil.repair(
-                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay), 
-                self.fac_b, self.fac_h, self.fac_limit_aspect)
-            if len(new_perm) > 0 and len(new_bay) > 0:
-                self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-                self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            else:
-                logger.error(f"repair 返回空数组: perm_len={len(new_perm)}, bay_len={len(new_bay)}")
-
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.fac_b,
+                self.fac_h,
+                self.fac_limit_aspect,
+            )
         elif action_name == "facility_insert":
             new_perm, new_bay = FBSUtil.facility_insert(
-                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay))
-            # 确保转换为列表并检查长度
-            if len(new_perm) > 0 and len(new_bay) > 0:
-                self.fbs_model.permutation = new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
-                self.fbs_model.bay = new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
-            else:
-                logger.error(f"facility_swap 返回空数组: perm_len={len(new_perm)}, bay_len={len(new_bay)}")
-
-        # --- 【【【 新增动作 5 的逻辑 】】】 ---
-        elif action_name == "ga_action":
-            # 'self' 就是 env_instance
-            # 调用我们在 FBSUtil.py 中新增的函数
-            # (注意: 您可能需要调整 pop_size 和 generations)
-            new_perm, new_bay = FBSUtil.ga_population_action(
-                self.fbs_model, 
-                self, 
-                pop_size=10, 
-                generations=30
+                np.array(self.fbs_model.permutation), np.array(self.fbs_model.bay)
             )
-            self.fbs_model.permutation = new_perm
-            self.fbs_model.bay = new_bay
-        # --- 【【【 新增结束 】】】 ---
-
+        elif action_name == "bay_shuffle":
+            new_perm, new_bay = FBSUtil.bay_shuffle(
+                self.fbs_model.permutation, self.fbs_model.bay
+            )
+        elif action_name == "facility_shuffle":
+            new_perm, new_bay = FBSUtil.facility_shuffle(
+                self.fbs_model.permutation, self.fbs_model.bay
+            )
+        elif action_name == "flow_guided_swap":
+            new_perm, new_bay = FBSUtil.flow_guided_swap(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "segment_insert":
+            new_perm, new_bay = FBSUtil.segment_insert(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "cross_bay_relocate":
+            new_perm, new_bay = FBSUtil.cross_bay_relocate(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "bay_split_by_flow":
+            new_perm, new_bay = FBSUtil.bay_split_by_flow(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "bay_merge_by_flow":
+            new_perm, new_bay = FBSUtil.bay_merge_by_flow(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "adjacent_bay_repartition_by_flow":
+            new_perm, new_bay = FBSUtil.adjacent_bay_repartition_by_flow(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "adjacent_bay_block_repartition_by_flow":
+            new_perm, new_bay = FBSUtil.adjacent_bay_block_repartition_by_flow(
+                np.array(self.fbs_model.permutation),
+                np.array(self.fbs_model.bay),
+                self.areas,
+                self.H,
+                self.F,
+                self.aspect_limits,
+                v_worst=self._runtime_v_worst(),
+                k_penalty=self.k_penalty,
+                distance_metric=self.distance_metric,
+            )
+        elif action_name == "ga_action":
+            new_perm, new_bay = FBSUtil.ga_population_action(
+                self.fbs_model,
+                self,
+                pop_size=10,
+                generations=30,
+            )
         elif action_name == "idle":
-            pass
-        # elif action_name == "bay_shuffle":
-        #     self.fbs_model.permutation, self.fbs_model.bay = FBSUtil.bay_shuffle(
-        #         self.fbs_model.permutation, self.fbs_model.bay)
-        # elif action_name == "facility_shuffle":
-        #     self.fbs_model.permutation, self.fbs_model.bay = FBSUtil.facility_shuffle(
-        #         self.fbs_model.permutation, self.fbs_model.bay)
+            return
         else:
             raise ValueError(f"Invalid action: {action_name}")
 
-        self.previous_MHC = self.MHC  # 保存上一步的MHC
-        self.previous_fitness = self.fitness  # 保存上一步的fitness
-        # 更新最佳适应度
-        # if self.MHC < self.best_MHC: 
-        #     self.best_MHC = self.MHC     
-        # 刷新状态
-        (
-            self.fac_x,
-            self.fac_y,
-            self.fac_h,
-            self.fac_b,
-            self.fac_aspect_ratio,
-            self.D,
-            self.TM,
-            self.MHC,
-            self.fitness,
-        # ) = FBSUtil.StatusUpdatingDevice(self.fbs_model, self.areas, self.H,
-        #                                  self.F, self.fac_limit_aspect)  
+        self.fbs_model.permutation = (
+            new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
+        )
+        self.fbs_model.bay = (
+            new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
+        )
 
-        ) = FBSUtil.StatusUpdatingDevice2(
-            self.fbs_model,
-            self.areas,
-            self.H,
-            self.F,
-            self.fac_limit_aspect,
-            g_best=self.best_fitness,
-            penalty_k=self.penalty_k,
-        )  
-        self.penalty_k = min(
-            self.penalty_k * self.penalty_k_growth, self.penalty_k_max
-        )
-                              
-        # 更新状态字典
-        self.state = self.constructState()
-        # 计算奖励函数
-        reward = self.calculate_reward_1()
-        self.previous_fitness = self.fitness
-        # 更新info字典，包含更多的调试信息
-        info = {
+    def calculate_reward(self, previous_cost, previous_d_inf, previous_best_feasible):
+        reward = 0.0
+        scale = max(self._runtime_v_worst() or 0.0, 1.0)
+        if np.isfinite(previous_cost) and np.isfinite(self.fitness):
+            reward += (previous_cost - self.fitness) / scale
+        reward += 0.25 * (previous_d_inf - self.current_d_inf)
+        if previous_d_inf > 0 and self.current_d_inf == 0:
+            reward += 0.5
+        if self.current_is_feasible and self.fitness < previous_best_feasible:
+            reward += 1.0
+        return float(np.clip(reward, -2.5, 2.5))
+
+    def _build_info(self, reward: float, action_name: str) -> Dict[str, Any]:
+        return {
             "TimeLimit.truncated": False,
-            "current_fitness": self.fitness,  # 当前适应度值
-            "previous_fitness": self.previous_fitness,  # 上一次的适应度值
-            "reward": reward,  # 当前步骤的奖励
-            "facility_count": self.n,  # 设施数量
-            "action_taken": action_name,  # 执行的动作名称
-            "layout_dimensions": (self.H, self.W),  # 布局的长和宽
+            "current_fitness": self.fitness,
+            "previous_fitness": self.previous_fitness,
+            "reward": reward,
+            "facility_count": self.n,
+            "action_taken": action_name,
+            "layout_dimensions": (self.H, self.W),
+            "instance": self.instance,
+            "mhc": self.MHC,
+            "d_inf": self.current_d_inf,
+            "is_feasible": self.current_is_feasible,
+            "v_worst": self._runtime_v_worst(),
+            "best_feasible_cost": self.best_feasible_cost,
+            "worst_feasible_cost": self.worst_feasible_cost,
         }
-        return (
-            self.state,
-            reward,
-            False,  # terminated
-            False,  # truncated
-            info,
-        )
+
+    def step(self, action):
+        action_name = self.actions[int(action)]
+        previous_cost = self.fitness
+        previous_best_feasible = self.best_feasible_cost
+        previous_d_inf = self.current_d_inf
+        previous_mhc = self.MHC
+
+        self._apply_action(action_name)
+        self._evaluate_current_layout(snapshot_best=True)
+        self.state = self.constructState()
+        reward = self.calculate_reward(previous_cost, previous_d_inf, previous_best_feasible)
+        self.previous_fitness = previous_cost
+        self.previous_MHC = previous_mhc
+        self.previous_d_inf = previous_d_inf
+        info = self._build_info(reward=reward, action_name=action_name)
+        return self.state, reward, False, False, info
 
     def step2(self, action):
-        # 根据action执行相应的操作
-        action_name = self.actions[int(action)]
-        if action_name == "bay_shuffle":
-            self.fbs_model.permutation, self.fbs_model.bay = FBSUtil.bay_shuffle(
-                self.fbs_model.permutation, self.fbs_model.bay)
-        elif action_name == "facility_shuffle":
-            self.fbs_model.permutation, self.fbs_model.bay = FBSUtil.facility_shuffle(
-                self.fbs_model.permutation, self.fbs_model.bay)
-        else:
-            raise ValueError(f"Invalid action: {action_name}")
-
-        self.previous_MHC = self.MHC  # 保存上一步的MHC
-        self.previous_fitness = self.fitness  # 保存上一步的fitness
-
-        # 刷新状态
-        (
-            self.fac_x,
-            self.fac_y,
-            self.fac_h,
-            self.fac_b,
-            self.fac_aspect_ratio,
-            self.D,
-            self.TM,
-            self.MHC,
-            self.fitness,
-        ) = FBSUtil.StatusUpdatingDevice(self.fbs_model, self.areas, self.H,
-                                         self.F, self.fac_limit_aspect)
-        self.penalty_k = min(
-            self.penalty_k * self.penalty_k_growth, self.penalty_k_max
-        )
-        # 更新状态字典
-        self.state = self.constructState()
-        # 计算奖励函数
-        reward = self.calculate_reward_1()
-        self.previous_fitness = self.fitness
-        # 更新info字典，包含更多的调试信息
-        info = {
-            "TimeLimit.truncated": False,
-            "current_fitness": self.fitness,  # 当前适应度值
-            "previous_fitness": self.previous_fitness,  # 上一次的适应度值
-            "reward": reward,  # 当前步骤的奖励
-            "facility_count": self.n,  # 设施数量
-            "action_taken": action_name,  # 执行的动作名称
-            "layout_dimensions": (self.H, self.W),  # 布局的长和宽
-        }
-        return (
-            self.state,
-            reward,
-            False,  # terminated
-            False,  # truncated
-            info,
-        )
+        return self.step(action)
 
     def render(self):
-        # 创建图形和坐标轴
         fig, ax = plt.subplots()
         ax.set_title("Facility layout")
         ax.set_xlabel("X-Axis")
@@ -478,73 +483,65 @@ class DataProcessingEnv(gym.Env):
         plt.grid(False)
         plt.gca().set_aspect("equal", adjustable="box")
 
-        # 绘制设施矩形
-        for i, facility_label in enumerate(self.fbs_model.permutation):
-            facility_idx = facility_label - 1  # 设施索引从0开始
+        state_reshaped = self.state.reshape(self.n, 3)
+        for facility_label in self.fbs_model.permutation:
+            facility_idx = int(facility_label) - 1
             x_from = self.fac_x[facility_idx] - self.fac_b[facility_idx] / 2
-            x_to = self.fac_x[facility_idx] + self.fac_b[facility_idx] / 2
             y_from = self.fac_y[facility_idx] - self.fac_h[facility_idx] / 2
-            y_to = self.fac_y[facility_idx] + self.fac_h[facility_idx] / 2
-
-            # 边框颜色表示长宽比状态
-            line_color = "red" if self.fac_aspect_ratio[facility_idx] > self.fac_limit_aspect else "green"
-
-            # 填充颜色表示成本（RGB）
-            state_reshaped = self.state.reshape(self.n, 3)
-            R = state_reshaped[facility_idx, 0] / 255
-            G = state_reshaped[facility_idx, 1] / 255
-            B = state_reshaped[facility_idx, 2] / 255
-            face_color = (R, G, B, 0.7)
-
+            line_color = (
+                "red"
+                if self.fac_aspect_ratio[facility_idx] > self.aspect_limits[facility_idx]
+                else "green"
+            )
+            face_color = (
+                state_reshaped[facility_idx, 0] / 255.0,
+                state_reshaped[facility_idx, 1] / 255.0,
+                state_reshaped[facility_idx, 2] / 255.0,
+                0.7,
+            )
             rect = patches.Rectangle(
                 (x_from, y_from),
-                width=x_to - x_from,
-                height=y_to - y_from,
+                width=self.fac_b[facility_idx],
+                height=self.fac_h[facility_idx],
                 edgecolor=line_color,
-                facecolor=face_color,  # 填充颜色
-                linewidth=1
+                facecolor=face_color,
+                linewidth=1,
             )
             ax.add_patch(rect)
-
-            # 显示设施ID
             ax.text(
-                x_from + (x_to - x_from) / 2,
-                y_from + (y_to - y_from) / 2,
+                x_from + self.fac_b[facility_idx] / 2,
+                y_from + self.fac_h[facility_idx] / 2,
                 f"{int(facility_label)}",
                 ha="center",
                 va="center",
-                color="white" if np.mean(face_color[:3]) < 0.5 else "black"  # 自适应文字颜色
+                color="white" if np.mean(face_color[:3]) < 0.5 else "black",
             )
 
-        # 显示MHC和Fitness
         plt.figtext(0.5, 0.93, f"MHC: {self.MHC:.2f}", ha="center", fontsize=12)
-        plt.figtext(0.5, 0.96,
-                    # f"Fitness: {FBSUtil.getFitness(self.MHC, self.fac_b, self.fac_h, self.fac_limit_aspect):.2f}",
-                    f"Fitness: {self.fitness:.2f}",
-                    ha="center", fontsize=12)
-
+        plt.figtext(0.5, 0.96, f"Cost: {self.fitness:.2f}", ha="center", fontsize=12)
         plt.show()
 
     def constructState(self):
-        state = np.zeros((self.n, 3))
-        permutation = self.fbs_model.permutation
-        TM = self.TM
-        sources = np.sum(TM, axis=1)
-        sinks = np.sum(TM, axis=0)
-        R = np.array(
-            ((permutation - np.min(permutation)) / (np.max(permutation) - np.min(permutation)))
-            * 255
-        ).astype(np.float64)
-        G = np.array(
-            ((sources - np.min(sources)) / (np.max(sources) - np.min(sources)))
-            * 255
-        ).astype(np.float64)
-        B = np.array(
-            ((sinks - np.min(sinks)) / (np.max(sinks) - np.min(sinks)))
-            * 255
-        ).astype(np.float64)
-        state[:, 0] = R
-        state[:, 1] = G
-        state[:, 2] = B
+        state = np.zeros((self.n, 3), dtype=np.float64)
+        permutation = np.asarray(self.fbs_model.permutation, dtype=float)
+        tm = np.asarray(self.TM, dtype=float)
+        sources = np.sum(tm, axis=1)
+        sinks = np.sum(tm, axis=0)
+
+        def scale_to_255(values):
+            values = np.asarray(values, dtype=float)
+            if values.size == 0:
+                return values
+            value_min = np.min(values)
+            value_max = np.max(values)
+            if np.isclose(value_min, value_max):
+                return np.zeros_like(values, dtype=np.float64)
+            return ((values - value_min) / (value_max - value_min) * 255.0).astype(np.float64)
+
+        state[:, 0] = scale_to_255(permutation)
+        state[:, 1] = scale_to_255(sources)
+        state[:, 2] = scale_to_255(sinks)
         return state.flatten()
+
+
 

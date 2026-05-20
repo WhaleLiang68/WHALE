@@ -1,0 +1,75 @@
+PDF: c:\Users\17122\PycharmProjects\pythonProject\ua-flp-LSA2\docs\Learning-based simulated annealing algorithm for unequal area facility layout problem-好.pdf
+PAGES: 16
+HITS: 17
+PAGE 1 | non-overlap | ntroduction The unequal area facility layout problem (UA-FLP) is a variation of the facility layout problems (FLPs) that involves arranging non-overlapping rectangular facilities in a planar area. The goal is to minimize the total material handling cost between facilities under the restriction of theunequal area and aspect ratio 
+PAGE 1 | feasible | Additional features include temperature sampling generation to minimize parameter settings, a greedy initial solution production to relax infeasiblerestrictions. Experimental results on 16 well-known instances validate LSA’s high proﬁciency compared to several state- of-the-art algorithms, and it exceeds 7 best-known solutions
+PAGE 2 | feasible | ive exploitation of the solution space. •Redesign of the speciﬁc cost function aims to fully leverage the beneﬁt information lying in the infeasible solutions. Proposal of a two-stage local search strategyfor an intensiﬁcation phase that explores promising areas of the search space, leading to signiﬁcant enhancement in solutio
+PAGE 2 | bay | ns of the facilities’ structural composition and location (Ahmadi et al. 2017 ). Among them, the non-slicing structure, such as the ﬂexible bay structure (FBS) (Tate and Smith 1995 ) and the slicing structure, such as slicing tree structure (STS) has received increasing attention (Kang and Chae 2017 ; Scalia et al. 2019 ;
+PAGE 3 | feasible |  operations were randomly utilized to move thecurrent conﬁguration to its neighborhood. However, the aforementioned methods only focused on feasible conﬁg- urations and discarded infeasible solutions, potentiallywasting searching time and overlooking valuable infor- mation present in infeasible solutions. Turgay ( 2018 ) addre
+PAGE 4 | bay | with objective of ﬁnding the best shortest single loop. They developed a hybrid algorithm based on Memetic and SA, where the former decided bay layouts,and the latter determined the corresponding single loop for each bay layout. The hybrid algorithm efﬁciently handled large-scale instances of this bi-level optimization pr
+PAGE 5 | feasible | straints prevent overstretching of facility shapes and ensure that they remain consistent with real-world scenarios. Equations 5–8deﬁne the feasible range for facility loca- tions, while Eqs. 7and 8further speciﬁcally address the prevention of overlap between facilities. Furthermore, in this study, only the material handling c
+PAGE 5 | bay | lue for k, we aim to enhance the conveyance of beneﬁcial information hidden within infeasible solutions. 3.2 Encoding of UA-FLP on FBS with bay list The FBS representation consists of two main parts. A rectangular plant is divided in one direction into several parallel bays, each with varying widths or heights. Withineach
+PAGE 6 | area constraint | ilities. Moreover, as the plant becomes ﬁlled with a couple of facilities, it becomes more difﬁcult to add large-size facilities due to the area constraint. To address these issues, an area-prior greedy initial construction method is pro-posed to enhance the efﬁciency of initialization. The pro- cess begins by sorting the facilities 
+PAGE 6 | bay | displays the corresponding solution representation. It includes the facility sequence and the bay divisions, indi- cating which facilities belong to the same bay. For instance, in bay 1, there are two facilities. Facility 1 is theﬁrst item in bay 1, where facility 2 is the las
+PAGE 7 | feasible | ing bay conﬁguration is gen- erated based on this permutation, while ensuring legalitythrough check. This process efﬁciently produces a new feasible representation for the initial FBS encoding. The detailed procedure is presented in Algorithm 3. Algorithm 3 Greedy initial solution generation 4.2 Neighborhood generators and lea
+PAGE 7 | bay | obtain an ordered sequence. A random two-point swap is then performed to generate a new random permutation. Subsequently, the corresponding bay conﬁguration is gen- erated based on this permutation, while ensuring legalitythrough check. This process efﬁciently produces a new feasible representation for the initial FBS enc
+PAGE 8 | feasible | of the results. 5.1 Contribution of improved penalty function As aforementioned, in Eq. 9, we have applied the worst value of all currently feasible solution to calculate thepenalty item. In contrast to the original penalty (OP), which relied on the difference between the ﬁtness of the currently best solution and the global be
+PAGE 8 | bay | indicating an excessive number of items within it, a facility is chosen at random to create a new bay by separating the remaining facilities adjacent to that bay. Conversely, if the bay is too narrow and can accommodate additional items,the current bay is merged with a randomly se
+PAGE 11 | bay | strategy that deeply explores the bay and facilities, it enhances the exploitation of the search space and guides the optimization process towards the more promising regions. This leads to improved performance and bet
+PAGE 14 | bay | oblem’s com-plexity necessitates the careful design of various neigh- borhood search structures to handle the permutation of facilities and bays separately. To ensure an effective searchprocess, a self-learning controller is employed to intelli- gently select the most promising operator from a set of operators. This contr
+PAGE 15 | bay | 50923 Hunagund I, Pillai V, Kempaiah U (2018) A simulated annealing algorithm for unequal area dynamic facility layout problemswith ﬂexible bay structure. Int J Ind Eng Comput 9:307–330. https://doi.org/10.5267/j.ijiec.2017.8.004 Hunagund IB, Pillai VM, Kempaiah UN (2021) Solving unequal area facility layout problems with
+
+=== AREA/CONSTRAINT CANDIDATE LINES ===
+PAGE 1: Learning-based simulated annealing algorithm for unequal area
+PAGE 1: This paper proposes a learning-based simulated annealing (LSA) algorithm to tackle the NP-hard unequal area facilitylayout problem (UA-FLP). The goal of UA-FLP is to optimize the material ﬂow between facilities of different sizes to
+PAGE 1: Keywords Simulated annealing /C1Reinforcement learning /C1Unequal area facility layout problem /C1Enhanced local search
+PAGE 1: The unequal area facility layout problem (UA-FLP) is a
+PAGE 1: a planar area. The goal is to minimize the total material
+PAGE 1: handling cost between facilities under the restriction of theunequal area and aspect ratio of the facilities (Armour and
+PAGE 2: areas of the search space, leading to signiﬁcant
+PAGE 3: given rectangular area into several equal-size units. How-
+PAGE 3: address unequal area dynamic FBS, employing a mixedinteger linear programming (MILP) model to compute the
+PAGE 3: remoteness function, area utilization, reconﬁguration cost,
+PAGE 3: software, but it struggled to achieve optimal results forLearning-based simulated annealing algorithm for unequal area facility layout problem 5669
+PAGE 4: The UA-FLP contains nfacilities within a rectangular area.
+PAGE 4: The total area, denoted as A, occupied by nfacilities must
+PAGE 4: not exceed the product of the width ( W) and height ( H)o f
+PAGE 4: the given two-dimensional area (Armour and Buffa 1963 ).
+PAGE 4: constraint is presented in Eq. 2:
+PAGE 4: Each facility must adhere to the following constraints:
+PAGE 4: region. This means the total width and height of all facil-
+PAGE 4: satisfy a shape constraint, which can be deﬁned as a
+PAGE 4: cally, the constraint conditions of facilities are maximumproportion constraint and minimum limit constraint. (3) All
+PAGE 4: Equation 3is the maximum proportion constraint and it
+PAGE 4: denotes that the ratio of height hiand width wiof the
+PAGE 4: ratio ari. Equation 4shows the minimum limit constraint
+PAGE 4: that the width wior height hiof the facility should be5670 J. Lin et al.
+PAGE 5: parallel bays, each with varying widths or heights. Withineach bay, multiple facilities of the same width or height are
+PAGE 5: wi The width of the facility i
+PAGE 5: hi The height of the facility i
+PAGE 5: with FBSLearning-based simulated annealing algorithm for unequal area facility layout problem 5671
+PAGE 6: extremely time-consuming due to the stringent constraintsinvolved. In UA-FLP, each facility is subjects to either a
+PAGE 6: maximum proportion constraint or a minimum value con-
+PAGE 6: straint. Intuitively, smaller facilities are more likely toviolate these constraints when they are located in the same
+PAGE 6: facilities due to the area constraint. To address these issues,
+PAGE 6: an area-prior greedy initial construction method is pro-posed to enhance the efﬁciency of initialization. The pro-
+PAGE 6: cess begins by sorting the facilities based on their areas to5672 J. Lin et al.
+PAGE 7: with a low probability. The repair process involvesselecting a random bay. If the selected bay is too wide,Learning-based simulated annealing algorithm for unequal area facility layout problem 5673
+PAGE 9: instancesInstance n Floor space Shape constraint References
+PAGE 9: Category 4 Du62 62 117.124 9117.124 ar= 4 Dunker et al. ( 2003 )Learning-based simulated annealing algorithm for unequal area facility layout problem 5675
+PAGE 11: Fig. 4 The comparison of Stdfor the original penalty and the improved penalty with different parameter kLearning-based simulated annealing algorithm for unequal area facility layout problem 5677
+PAGE 13: Fig. 5 The comparison of duration timeLearning-based simulated annealing algorithm for unequal area facility layout problem 5679
+PAGE 15: dimensions, we intend to effectively tackle many-objective
+PAGE 15: Ahmadi-Javid A, Ardestani-Jaafari A (2021) The unequal area facility
+PAGE 15: optimization algorithm for solving unequal area facility layoutproblems. Expert Syst Appl 138:112819. https://doi.org/10.1016/
+PAGE 15: (2020a) Addressing unequal area facility layout problems with
+PAGE 15: optimization algorithm for the unequal area facility layoutproblem. Swarm Evol Comput 55:100688. https://doi.org/10.
+PAGE 15: coding genetic algorithm in optimization of unequal areaproduction facilities layout. Comput Intell Neurosci
+PAGE 15: algorithm for unequal area dynamic facility layout problemswith ﬂexible bay structure. Int J Ind Eng Comput 9:307–330.
+PAGE 15: Hunagund IB, Pillai VM, Kempaiah UN (2021) Solving unequal area
+PAGE 15: unequal area facility. Expert Syst Appl 79:269–281. https://doi.
+PAGE 15: unequal area facility layout problem. Soft Comput
+PAGE 15: Kulturel-Konak S, Konak A (2011) Unequal area ﬂexible bay facility
+PAGE 15: https://doi.org/10.1016/j.swevo.2023.101274Learning-based simulated annealing algorithm for unequal area facility layout problem 5681
+PAGE 16: island model genetic algorithm for unequal area facility layout
+PAGE 16: Tate* DM, Smith AE (1995) Unequal-area facility layout by genetic

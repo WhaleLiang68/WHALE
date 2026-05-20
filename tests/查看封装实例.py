@@ -3,7 +3,6 @@ import numpy as np
 import os
 import csv
 import pandas
-import src.utils.config as config
 # 获取脚本所在目录（方法1）
 script_dir = os.path.dirname(os.path.abspath(__file__))
 print("[os] 脚本所在目录:", script_dir)
@@ -68,7 +67,7 @@ print("键值类型分布:", analyze_value_types(data))
 import pandas as pd
 
 # 打印第一个字典中某个复杂键的值
-sample_key = "AB20-ar3"
+sample_key = "SC35"
 
 # sample_value = pd.DataFrame(data[1][sample_key])
 sample_value = data[4][sample_key]
@@ -172,18 +171,3 @@ np.set_printoptions(threshold=np.inf, linewidth=200)
 #     formatted_row = [f"{x:.2f}" if isinstance(x, (float, np.floating)) else str(x) for x in row]
 #     print("  ".join(formatted_row))
 
-with open(
-        config.FILE_PATH,
-        "rb",
-) as file:
-    (
-        problems,
-        FlowMatrices,
-        sizes,
-        LayoutWidths,
-        LayoutLengths,
-    ) = pickle.load(file)
-F=FlowMatrices[sample_key]
-print(F)
-T_F = F + F.T
-print(T_F)

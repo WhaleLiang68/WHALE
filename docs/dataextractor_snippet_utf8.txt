@@ -1,0 +1,38 @@
+2: import pickle
+24:     def __init__(self, instance=None, seed=None, options=None):
+26:         with open(config.FILE_PATH, "rb") as file:
+30:                 self.sizes,
+33:             ) = pickle.load(file)
+35:         self.instance = instance
+36:         if self.instance not in self.problems or self.instance not in self.FlowMatrices:
+37:             valid_instances = list(self.FlowMatrices.keys())
+38:             raise ValueError(f"Instance '{instance}' not found. Valid instances: {valid_instances}")
+41:         raw_F = np.asarray(self.FlowMatrices[self.instance])
+46:         self.n = self.problems[self.instance]
+47:         self.areas, self.aspect_limits = FBSUtil.getAreaData(self.sizes[self.instance])
+48:         self.fac_limit_aspect = FBSUtil.get_instance_aspect_limit(self.aspect_limits)
+49:         self.H = self.LayoutWidths[self.instance]
+50:         self.W = self.LayoutLengths[self.instance]
+111:         self.worst_feasible_cost = None
+116:         if self.worst_feasible_cost is None or not np.isfinite(self.worst_feasible_cost):
+118:         return float(self.worst_feasible_cost)
+128:         if self.worst_feasible_cost is None:
+129:             self.worst_feasible_cost = float(cost)
+131:             self.worst_feasible_cost = max(float(self.worst_feasible_cost), float(cost))
+156:             self.H,
+174:         B = FBSUtil.select_B(self.areas, self.n, self.fac_limit_aspect, self.W)
+184:             genes=genes.tolist() if isinstance(genes, np.ndarray) else genes,
+246:                 self.H,
+258:                 self.H,
+270:                 self.H,
+282:                 self.H,
+294:                 self.H,
+306:                 self.H,
+318:                 self.H,
+338:             new_perm.tolist() if isinstance(new_perm, np.ndarray) else list(new_perm)
+341:             new_bay.tolist() if isinstance(new_bay, np.ndarray) else list(new_bay)
+364:             "layout_dimensions": (self.H, self.W),
+365:             "instance": self.instance,
+371:             "worst_feasible_cost": self.worst_feasible_cost,
+399:         ax.set_xlim(0, self.W)
+400:         ax.set_ylim(0, self.H)

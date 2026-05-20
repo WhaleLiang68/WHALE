@@ -1,0 +1,105 @@
+﻿    def _observe_feasible_state(self, solution):
+        if not getattr(solution, "current_is_feasible", False):
+            self._last_archive_observation = {"archive_changed": False, "rep_changed": False}
+            return False
+
+        self.feasible_solution_count += 1
+        self.mo_worst_feasible_mhc = (
+            float(solution.MHC)
+            if self.mo_worst_feasible_mhc is None
+            else max(float(self.mo_worst_feasible_mhc), float(solution.MHC))
+        )
+
+        previous_rep_vector = None
+        previous_rep_score = float(self.representative_decision_score)
+        if self.representative_solution is not None and getattr(self.representative_solution, "mo_objectives_min", None) is not None:
+            previous_rep_vector = np.asarray(self.representative_solution.mo_objectives_min, dtype=float)
+
+        updated_archive, inserted, removed = MO_FBSUtil.update_pareto_archive(
+            self.pareto_archive,
+            solution,
+            max_size=self.archive_limit,
+            clone_fn=copy.deepcopy,
+        )
+        archive_changed = bool(inserted)
+        if archive_changed:
+            self.pareto_archive = updated_archive
+        elif not self.pareto_archive and getattr(solution, "current_is_feasible", False):
+            self.pareto_archive = [copy.deepcopy(solution)]
+            archive_changed = True
+
+        self._refresh_archive_state()
+        self._refresh_solution_search_metrics(solution)
+
+        if self.representative_solution is not None:
+            self.best_feasible_solution = copy.deepcopy(self.representative_solution)
+            self.gbest = copy.deepcopy(self.representative_solution)
+            self.true_gbest = copy.deepcopy(self.representative_solution)
+            self.best_feasible_cost = float(self.representative_decision_score)
+            self.best_energy = float(self.representative_decision_score)
+        elif np.isfinite(getattr(solution, "decision_score", math.inf)):
+            self.best_feasible_solution = copy.deepcopy(solution)
+            self.gbest = copy.deepcopy(solution)
+            self.true_gbest = copy.deepcopy(solution)
+            self.best_feasible_cost = float(solution.decision_score)
+            self.best_energy = float(solution.decision_score)
+
+        feasible_cost = float(getattr(solution, "fitness", math.inf))
+        self.worst_feasible_cost = (
+            feasible_cost if self.worst_feasible_cost is None else max(float(self.worst_feasible_cost), feasible_cost)
+        )
+
+        rep_changed = False
+        if self.representative_solution is not None:
+            current_rep_vector = np.asarray(self.representative_solution.mo_objectives_min, dtype=float)
+            if previous_rep_vector is None:
+                rep_changed = True
+            elif not np.allclose(current_rep_vector, previous_rep_vector, atol=1e-9, rtol=1e-7):
+                rep_changed = True
+            elif float(self.representative_decision_score) < previous_rep_score - 1e-12:
+                rep_changed = True
+            if rep_changed:
+                self.gbest_update_count += 1
+                self.best_history.append(float(self.representative_decision_score))
+
+        self._last_archive_observation = {
+            "archive_changed": bool(archive_changed),
+            "rep_changed": bool(rep_changed),
+            "inserted": bool(inserted),
+            "removedCount": len(removed),
+        }
+        if archive_changed or rep_changed:
+            self._increment_archive_counters(archive_changed=archive_changed, rep_changed=rep_changed)
+        if archive_changed:
+            self._record_mo_event(
+                "archive_update",
+                inserted=bool(inserted),
+                removedCount=len(removed),
+                candidateDecisionScore=self._safe_float(getattr(solution, "decision_score", None)),
+                candidateMhc=self._safe_float(getattr(solution, "MHC", None)),
+                candidateCr=self._safe_float(getattr(solution, "CR", None)),
+                candidateDr=self._safe_float(getattr(solution, "DR", None)),
+                candidateAr=self._safe_float(getattr(solution, "AR", None)),
+            )
+        if rep_changed and self.representative_solution is not None:
+            self._record_mo_event(
+                "representative_update",
+                representativeArchiveIndex=None if self.representative_archive_index is None else int(self.representative_archive_index) + 1,
+                representativeDecisionScore=self._safe_float(self.representative_decision_score),
+                representativeMhc=self._safe_float(getattr(self.representative_solution, "MHC", None)),
+                representativeCr=self._safe_float(getattr(self.representative_solution, "CR", None)),
+                representativeDr=self._safe_float(getattr(self.representative_solution, "DR", None)),
+                representativeAr=self._safe_float(getattr(self.representative_solution, "AR", None)),
+            )
+
+        for env_obj in (solution, getattr(self, "s", None), self.gbest, self.true_gbest):
+            if env_obj is None:
+                continue
+            env_obj.feasible_solution_count = self.feasible_solution_count
+            env_obj.best_feasible_cost = self.best_feasible_cost
+            env_obj.worst_feasible_cost = self.worst_feasible_cost
+            env_obj.best_fitness = self.best_feasible_cost
+            env_obj.current_v_worst = self.worst_feasible_cost
+            if getattr(env_obj, "mo_objectives_min", None) is not None:
+                self._refresh_solution_search_metrics(env_obj)
+        return bool(archive_changed or rep_changed)

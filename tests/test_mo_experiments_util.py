@@ -77,6 +77,50 @@ class TestMOExperimentsUtil(unittest.TestCase):
             exported_trace = pd.read_csv(outputs['trace'], encoding='utf-8-sig')
             self.assertEqual(len(exported_trace), 1)
 
+    def test_recorder_summary_csv_can_expand_columns(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result_root = Path(tmp_dir) / 'files' / 'expresults'
+            start_time = datetime.datetime(2026, 5, 10, 9, 0, 0)
+
+            recorder_a = MOExperimentRecorder(
+                instance='AB20-ar3',
+                algorithm='ELP_DRL_MO',
+                start_time=start_time,
+                result_root=result_root,
+            )
+            recorder_a.finalize(
+                {
+                    'startTime': start_time.isoformat(),
+                    'endTime': start_time.isoformat(),
+                    'runtimeSeconds': 1.0,
+                    'decisionScore': 0.2,
+                },
+                {'meta': {}, 'overall': {}, 'actions': {}},
+            )
+
+            recorder_b = MOExperimentRecorder(
+                instance='AB20-ar3',
+                algorithm='ELP_DRL_MO',
+                start_time=start_time + datetime.timedelta(seconds=5),
+                result_root=result_root,
+            )
+            recorder_b.finalize(
+                {
+                    'startTime': (start_time + datetime.timedelta(seconds=5)).isoformat(),
+                    'endTime': (start_time + datetime.timedelta(seconds=6)).isoformat(),
+                    'runtimeSeconds': 1.0,
+                    'decisionScore': 0.1,
+                    'archiveIgd': 0.03,
+                    'referenceFrontPath': 'files/expresults/reference_fronts/AB20-ar3_global_reference_front.json',
+                },
+                {'meta': {}, 'overall': {}, 'actions': {}},
+            )
+
+            summary = load_mo_run_summary_frame(result_root=result_root, instance='AB20-ar3', algorithm='ELP_DRL_MO')
+            self.assertEqual(len(summary), 2)
+            self.assertIn('archiveIgd', summary.columns)
+            self.assertAlmostEqual(float(summary.iloc[1]['archiveIgd']), 0.03)
+
 
 if __name__ == '__main__':
     unittest.main()

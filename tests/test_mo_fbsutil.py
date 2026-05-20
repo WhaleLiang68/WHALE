@@ -59,7 +59,17 @@ class TestMOFBSUtil(unittest.TestCase):
         self.assertAlmostEqual(objectives[0], 10.0)
         self.assertAlmostEqual(objectives[1], 5.0)
         self.assertAlmostEqual(objectives[2], 7.5)
-        self.assertAlmostEqual(objectives[3], (1.0 + (2.0 / 3.0)) / 2.0)
+        self.assertAlmostEqual(objectives[3], 0.0)
+
+    def test_calculate_ar_scores_uses_paper_triangular_satisfaction(self):
+        aspect_ratios, scores = MO_FBSUtil.calculate_ar_scores(
+            fac_b=np.array([1.0, 1.5, 2.0, 2.5, 3.0]),
+            fac_h=np.ones(5),
+            aspect_limits=np.full(5, 2.5),
+        )
+
+        np.testing.assert_allclose(aspect_ratios, np.array([1.0, 1.5, 2.0, 2.5, 3.0]))
+        np.testing.assert_allclose(scores, np.array([0.0, 1.0, 0.5, 0.0, 0.0]), atol=1e-12)
 
     def test_compare_solution_quality_prefers_feasible_then_pareto(self):
         feasible = SimpleNamespace(
@@ -142,6 +152,63 @@ class TestMOFBSUtil(unittest.TestCase):
         ]
         subset = MO_FBSUtil.select_nfcs_subset(candidates, max_size=3)
         self.assertEqual(len(subset), 3)
+
+    def test_archive_hypervolume_uses_union_volume(self):
+        candidates = [
+            SimpleNamespace(mo_objectives_min=np.array([0.2, 0.3, 0.2, 0.3], dtype=float)),
+            SimpleNamespace(mo_objectives_min=np.array([0.3, 0.2, 0.3, 0.2], dtype=float)),
+        ]
+
+        hv = MO_FBSUtil.archive_hypervolume(
+            candidates,
+            ideal=np.zeros(4, dtype=float),
+            nadir=np.ones(4, dtype=float),
+            reference_margin=0.1,
+        )
+
+        expected = (0.2 * 0.1 * 0.2 * 0.1) + (0.1 * 0.2 * 0.1 * 0.2) - (0.1 * 0.1 * 0.1 * 0.1)
+        self.assertAlmostEqual(hv, expected, places=12)
+
+    def test_update_archive_can_require_candidate_retained_after_trim(self):
+        archive = [
+            SimpleNamespace(
+                current_is_feasible=True,
+                current_d_inf=0,
+                constraint_violation=0.0,
+                mo_objectives_min=np.array([0.0, 1.0, 1.0, 1.0], dtype=float),
+            ),
+            SimpleNamespace(
+                current_is_feasible=True,
+                current_d_inf=0,
+                constraint_violation=0.0,
+                mo_objectives_min=np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
+            ),
+        ]
+        middle_candidate = SimpleNamespace(
+            current_is_feasible=True,
+            current_d_inf=0,
+            constraint_violation=0.0,
+            mo_objectives_min=np.array([0.5, 0.5, 0.5, 0.5], dtype=float),
+        )
+
+        updated_default, inserted_default, _ = MO_FBSUtil.update_pareto_archive(
+            archive,
+            middle_candidate,
+            max_size=2,
+        )
+        updated_strict, inserted_strict, _ = MO_FBSUtil.update_pareto_archive(
+            archive,
+            middle_candidate,
+            max_size=2,
+            require_candidate_retained=True,
+        )
+
+        self.assertTrue(inserted_default)
+        self.assertEqual(len(updated_default), 2)
+        self.assertFalse(any(np.allclose(item.mo_objectives_min, middle_candidate.mo_objectives_min) for item in updated_default))
+        self.assertFalse(inserted_strict)
+        self.assertEqual(len(updated_strict), 2)
+        self.assertTrue(all(np.allclose(left.mo_objectives_min, right.mo_objectives_min) for left, right in zip(updated_strict, archive)))
 
 
 if __name__ == "__main__":

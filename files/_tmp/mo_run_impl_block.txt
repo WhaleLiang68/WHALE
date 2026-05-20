@@ -1,0 +1,280 @@
+﻿    def _run_impl(self):
+        start_time = datetime.datetime.now()
+        fast_time = start_time
+        self._reset_mo_logging_state()
+        self._run_start_time = start_time
+
+        agent_mode = os.getenv("ELP_RL_AGENT", "dqn").strip().lower()
+        self.agent_mode = agent_mode
+        run_algorithm = os.getenv("ELP_EXP_ALGORITHM", "ELP_DRL_MO")
+        run_remark = os.getenv("ELP_EXP_REMARK", "")
+        self.mo_recorder = MO_ExperimentsUtil.MOExperimentRecorder(
+            instance=self.instance_name,
+            algorithm=run_algorithm,
+            start_time=start_time,
+            trace_interval=self.mo_trace_interval,
+            remark=run_remark,
+            result_root=config.RESULT_PATH,
+        )
+
+        if agent_mode == "qlearning":
+            agent = StandardQLearningAgent(s_dim=16384, a_dim=len(self.valid_actions))
+        else:
+            agent = StandardDQNAgent(
+                s_dim=16384,
+                a_dim=len(self.valid_actions),
+                epsilon=0.50,
+                epsilon_min=self.dqn_epsilon_min,
+                epsilon_decay=self.dqn_epsilon_decay,
+                gamma=0.95,
+                lr=3e-4,
+                batch_size=64,
+                replay_capacity=50000,
+                warmup_steps=self.dqn_warmup_steps,
+                update_every=4,
+                target_update_every=self.dqn_target_update_every,
+                idqn_k=2,
+                embedding_dim=32,
+                hidden_dim=64,
+                grad_clip=10.0,
+            )
+        if not self._bootstrap_until_first_feasible():
+            logger.warning("Failed to seed a feasible archive before ELP search.")
+        if np.isfinite(self.best_feasible_cost):
+            self.best_energy = self.best_feasible_cost
+            self.current_energy = self.s.fitness
+
+        global_step = 0
+        total_steps = max(1, self.G * self.t_max)
+        next_progress_marker_idx = 0
+        for episode in range(self.G):
+            if self.worst_feasible_cost is None and not self._bootstrap_until_first_feasible(max_attempts=max(200, 2 * self.t_max)):
+                logger.warning(f"Episode {episode}: feasible archive still unavailable.")
+                continue
+            episode_best_before = self.best_feasible_cost
+            self._prepare_episode_start(episode)
+            for step_idx in range(self.t_max):
+                self._trace_global_step = global_step
+                self._trace_episode_index = episode
+                self._trace_step_index = step_idx
+                self.current_progress_ratio = float(global_step) / float(max(1, total_steps))
+                current_state_idx = self.state_encoder(self.s)
+                allowed_actions = self._get_allowed_action_indices(self.s)
+                action_table_idx = agent.select_action(current_state_idx, allowed_actions=allowed_actions)
+                real_action_idx = self.valid_actions[action_table_idx]
+                previous_cost = self.s.fitness
+                previous_d_inf = self.s.current_d_inf
+                previous_best_feasible = self.best_feasible_cost
+
+                candidate = self.generate_candidate_by_action(self.s, real_action_idx)
+                self._record_action_selection(
+                    real_action_idx,
+                    previous_cost,
+                    candidate.fitness,
+                    phase="main",
+                )
+                self._pending_candidate = candidate
+                accept, prob, _, _ = self._accept_candidate(self.s.fitness, candidate.fitness)
+                self._pending_candidate = None
+                self.prob_history.append(prob)
+                self._record_acceptance(accept)
+                improved = False
+
+                if accept:
+                    self.s = candidate
+                    self.current_energy = self.s.fitness
+                    archive_improved = self._observe_feasible_state(self.s)
+                    if archive_improved:
+                        self._record_action_global_best(real_action_idx, phase="main")
+                    accepted_improved = bool(
+                        np.isfinite(previous_cost)
+                        and np.isfinite(self.s.fitness)
+                        and self.s.fitness < previous_cost
+                    )
+                    self._record_action_acceptance(
+                        real_action_idx,
+                        previous_cost,
+                        self.s.fitness,
+                        improved=accepted_improved,
+                        phase="main",
+                    )
+                    improved = bool(archive_improved)
+                    relative_improvement = 0.0
+                    if np.isfinite(previous_cost) and abs(previous_cost) > 1e-12 and np.isfinite(self.s.fitness):
+                        relative_improvement = max((previous_cost - self.s.fitness) / abs(previous_cost), 0.0)
+                    trigger_local_search = improved or (relative_improvement >= 0.005)
+                    self._update_histogram(self.s.fitness)
+                    if improved:
+                        self.no_improve_steps = 0
+                        fast_time = datetime.datetime.now()
+                    else:
+                        self.no_improve_steps += 1
+
+                    if trigger_local_search:
+                        local_search_best_before = self.best_feasible_cost
+                        local_search_cost_before = self.s.fitness
+                        previous_context = dict(getattr(self, "_current_action_context", {}) or {})
+                        self._set_action_context("local_search", action_name="greedy_local_search")
+                        self.s = self._greedy_local_search(self.s)
+                        self.current_energy = self.s.fitness
+                        local_search_improved = bool(
+                            np.isfinite(self.best_feasible_cost)
+                            and self.best_feasible_cost < local_search_best_before
+                        )
+                        self._note_local_search(improved=local_search_improved)
+                        self._record_mo_event(
+                            "local_search",
+                            improved=local_search_improved,
+                            beforeSearchEnergy=self._safe_float(local_search_cost_before),
+                            afterSearchEnergy=self._safe_float(self.s.fitness),
+                        )
+                        self._current_action_context = previous_context
+                        if self.s.current_is_feasible and self.s.fitness < previous_best_feasible:
+                            improved = True
+
+                else:
+                    self._update_histogram(self.s.fitness)
+                    self.no_improve_steps += 1
+
+                if improved:
+                    self.no_improve_steps = 0
+                    fast_time = datetime.datetime.now()
+                    fast_time, _ = self._elite_intensification(fast_time)
+
+                gbest_recomputed = bool(
+                    np.isfinite(self.best_feasible_cost)
+                    and self.best_feasible_cost < previous_best_feasible
+                )
+                if gbest_recomputed:
+                    self.T_min = self._sample_temperature_floor()
+                    self._record_mo_event(
+                        "temperature_floor_update",
+                        bestDecisionScore=self._safe_float(self.best_feasible_cost),
+                        temperatureMin=self._safe_float(self.T_min),
+                    )
+
+                next_state_idx = self.state_encoder(self.s)
+                allowed_next_actions = self._get_allowed_action_indices(self.s)
+                reward = self._compute_transition_reward(
+                    previous_cost,
+                    self.s.fitness,
+                    previous_d_inf,
+                    self.s.current_d_inf,
+                    previous_best_feasible,
+                    accept,
+                )
+                done_flag = step_idx == self.t_max - 1
+                loss_value = agent.update_Q(
+                    current_state_idx,
+                    action_table_idx,
+                    reward,
+                    next_state_idx,
+                    done=done_flag,
+                    allowed_next_actions=allowed_next_actions,
+                )
+                self._last_loss_value = loss_value
+                self._update_transition_counters(accept, prob, reward, loss_value)
+                self.modified_energy_history.append(self._tilde_energy(self.s.fitness))
+                self.energy_history.append(self.s.fitness)
+                global_step += 1
+                self._trace_global_step = global_step
+                while (
+                    next_progress_marker_idx < len(self.progress_markers)
+                    and (global_step / total_steps) >= self.progress_markers[next_progress_marker_idx]
+                ):
+                    self._log_training_progress(self.progress_markers[next_progress_marker_idx], start_time)
+                    next_progress_marker_idx += 1
+
+                self._record_trace_snapshot(global_step, total_steps, episode, step_idx, agent)
+                fast_time, reheated = self._attempt_reheating(global_step, total_steps, fast_time)
+                if (not reheated) and self.no_improve_steps >= self.diversify_trigger_no_improve:
+                    self._attempt_diversification(global_step)
+                self._clear_action_context()
+
+            finalize_episode = getattr(agent, "finalize_episode", None)
+            if callable(finalize_episode):
+                finalize_episode()
+
+            self.T = max(self.T * self.cooling_per_step, self.T_min)
+
+            if np.isfinite(self.best_feasible_cost) and self.best_feasible_cost < episode_best_before:
+                self.episodes_without_improvement = 0
+            else:
+                self.episodes_without_improvement += 1
+            agent.decay_epsilon()
+
+        while next_progress_marker_idx < len(self.progress_markers):
+            self._log_training_progress(self.progress_markers[next_progress_marker_idx], start_time)
+            next_progress_marker_idx += 1
+
+        end_time = datetime.datetime.now()
+        self._record_trace_snapshot(global_step, total_steps, max(self.G - 1, 0), max(self.t_max - 1, 0), agent)
+        self._refresh_archive_state()
+
+        best_solution = self.best_feasible_solution if self.best_feasible_solution is not None else copy.deepcopy(self.s)
+        is_valid = bool(getattr(best_solution, "current_is_feasible", False))
+        best_energy = float(self.best_feasible_cost if np.isfinite(self.best_feasible_cost) else best_solution.fitness)
+        if self.representative_solution is not None:
+            best_solution = copy.deepcopy(self.representative_solution)
+            best_energy = float(self.representative_decision_score)
+            is_valid = bool(getattr(best_solution, "current_is_feasible", False))
+
+        archive_path = self._save_pareto_archive(start_time)
+        solution_array = getattr(getattr(best_solution, "fbs_model", None), "array_2d", None)
+        if hasattr(solution_array, "tolist"):
+            solution_array = solution_array.tolist()
+        best_result_seconds = None if fast_time is None else (fast_time - start_time).total_seconds()
+        self._record_mo_event(
+            "run_completed",
+            totalIterations=int(global_step),
+            runtimeSeconds=self._safe_float((end_time - start_time).total_seconds()),
+            bestResultSeconds=self._safe_float(best_result_seconds),
+            archivePath=archive_path,
+        )
+        action_stats = self._build_action_stats_payload(agent, global_step)
+        run_summary = {
+            "startTime": start_time.isoformat(),
+            "fastTime": None if fast_time is None else fast_time.isoformat(),
+            "endTime": end_time.isoformat(),
+            "runtimeSeconds": (end_time - start_time).total_seconds(),
+            "bestResultSeconds": best_result_seconds,
+            "iterations": int(global_step),
+            "isValid": bool(is_valid),
+            "gbestUpdateCount": int(self.gbest_update_count),
+            "feasibleSolutionCount": int(self.feasible_solution_count),
+            "archiveSize": int(len(self.pareto_archive)),
+            "representativeArchiveIndex": None if self.representative_archive_index is None else int(self.representative_archive_index) + 1,
+            "decisionScore": self._safe_float(best_energy),
+            "repMhc": None if best_solution is None else self._safe_float(getattr(best_solution, "MHC", None)),
+            "repCr": None if best_solution is None else self._safe_float(getattr(best_solution, "CR", None)),
+            "repDr": None if best_solution is None else self._safe_float(getattr(best_solution, "DR", None)),
+            "repAr": None if best_solution is None else self._safe_float(getattr(best_solution, "AR", None)),
+            "paretoArchivePath": archive_path,
+            "agentMode": agent_mode,
+            "epsilonEnd": self._safe_float(getattr(agent, "epsilon", None)),
+            "agentOptimizeSteps": int(getattr(agent, "optimize_steps", 0) or 0) if hasattr(agent, "optimize_steps") else None,
+            "agentTotalSteps": int(getattr(agent, "total_steps", 0) or 0) if hasattr(agent, "total_steps") else None,
+            "G": int(self.G),
+            "tMax": int(self.t_max),
+            "archiveLimit": int(self.archive_limit),
+            "traceInterval": int(self.mo_trace_interval),
+            "objectiveWeights": np.asarray(self.mo_weights, dtype=float).tolist(),
+            "representativeSolution": solution_array,
+        }
+        self.mo_run_summary = self.mo_recorder.finalize(run_summary, action_stats)
+        self.last_run_payload = {
+            "pareto_archive_path": archive_path,
+            "pareto_size": len(self.pareto_archive),
+            "rep_mhc": None if best_solution is None else float(getattr(best_solution, "MHC", math.inf)),
+            "rep_cr": None if best_solution is None else float(getattr(best_solution, "CR", 0.0)),
+            "rep_dr": None if best_solution is None else float(getattr(best_solution, "DR", 0.0)),
+            "rep_ar": None if best_solution is None else float(getattr(best_solution, "AR", 0.0)),
+            "decision_score": None if not np.isfinite(best_energy) else float(best_energy),
+            "mo_run_id": self.mo_run_summary.get("runId"),
+            "mo_bundle_dir": self.mo_run_summary.get("bundleDir"),
+            "mo_trace_path": self.mo_run_summary.get("tracePath"),
+            "mo_events_path": self.mo_run_summary.get("eventsPath"),
+            "mo_action_stats_path": self.mo_run_summary.get("actionStatsPath"),
+            "mo_run_summary_path": self.mo_run_summary.get("runSummaryPath"),
+        }
+        return global_step, is_valid, best_solution, best_energy, start_time, end_time, fast_time

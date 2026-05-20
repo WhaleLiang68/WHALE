@@ -96,7 +96,7 @@ class MO_FBSUtil:
         return float(np.sum(short_violation + long_violation))
 
     @staticmethod
-    def calculate_ar_scores(fac_b, fac_h, aspect_limits=None):
+    def calculate_ar_scores(fac_b, fac_h, aspect_limits=None, optimal_aspect_ratio=1.5):
         widths = MO_FBSUtil._as_float_vector(fac_b)
         heights = MO_FBSUtil._as_float_vector(fac_h, minimum_size=widths.size, fill_value=1.0)
         minimum_side = np.minimum(widths, heights)
@@ -119,13 +119,29 @@ class MO_FBSUtil:
                 aspect_limits = aspect_limits[: aspect_ratios.size]
 
         aspect_limits = np.clip(aspect_limits, 1.0 + 1e-12, None)
-        scores = np.ones_like(aspect_ratios, dtype=float)
-        overflow_mask = aspect_ratios > aspect_limits
-        scores[overflow_mask] = np.divide(
-            aspect_limits[overflow_mask],
-            aspect_ratios[overflow_mask],
-            out=np.zeros_like(aspect_ratios[overflow_mask], dtype=float),
-            where=np.isfinite(aspect_ratios[overflow_mask]) & (aspect_ratios[overflow_mask] > 0),
+        lower_limits = np.ones_like(aspect_limits, dtype=float)
+        optimal = np.full_like(aspect_limits, float(optimal_aspect_ratio), dtype=float)
+        narrow_limit_mask = aspect_limits <= optimal
+        if np.any(narrow_limit_mask):
+            # 若数据集给出的上界低于论文默认最优值，使用可行区间中点保持满意度函数可定义。
+            optimal[narrow_limit_mask] = 0.5 * (lower_limits[narrow_limit_mask] + aspect_limits[narrow_limit_mask])
+        optimal = np.clip(optimal, lower_limits + 1e-12, aspect_limits - 1e-12)
+
+        scores = np.zeros_like(aspect_ratios, dtype=float)
+        finite_mask = np.isfinite(aspect_ratios)
+        left_mask = finite_mask & (aspect_ratios >= lower_limits) & (aspect_ratios <= optimal)
+        scores[left_mask] = np.divide(
+            aspect_ratios[left_mask] - lower_limits[left_mask],
+            optimal[left_mask] - lower_limits[left_mask],
+            out=np.zeros_like(aspect_ratios[left_mask], dtype=float),
+            where=(optimal[left_mask] - lower_limits[left_mask]) > 1e-12,
+        )
+        right_mask = finite_mask & (aspect_ratios > optimal) & (aspect_ratios <= aspect_limits)
+        scores[right_mask] = np.divide(
+            aspect_limits[right_mask] - aspect_ratios[right_mask],
+            aspect_limits[right_mask] - optimal[right_mask],
+            out=np.zeros_like(aspect_ratios[right_mask], dtype=float),
+            where=(aspect_limits[right_mask] - optimal[right_mask]) > 1e-12,
         )
         scores[~np.isfinite(scores)] = 0.0
         return aspect_ratios, np.clip(scores, 0.0, 1.0)
@@ -141,6 +157,7 @@ class MO_FBSUtil:
         rel_matrix=None,
         dist_req_matrix=None,
         aspect_limits=None,
+        optimal_aspect_ratio=1.5,
     ):
         f1_mhc = float(mhc)
 
@@ -156,7 +173,12 @@ class MO_FBSUtil:
             distance_matrix = np.sqrt(delta_x**2 + delta_y**2)
             f3_dr = float(np.sum(np.triu(np.asarray(dist_req_matrix, dtype=float) * distance_matrix, k=1)))
 
-        _aspect_ratios, ar_scores = MO_FBSUtil.calculate_ar_scores(fac_b, fac_h, aspect_limits=aspect_limits)
+        _aspect_ratios, ar_scores = MO_FBSUtil.calculate_ar_scores(
+            fac_b,
+            fac_h,
+            aspect_limits=aspect_limits,
+            optimal_aspect_ratio=optimal_aspect_ratio,
+        )
         f4_ar = float(np.mean(ar_scores)) if ar_scores.size else 0.0
 
         return [f1_mhc, f2_cr, f3_dr, f4_ar]
@@ -313,6 +335,165 @@ class MO_FBSUtil:
         return np.min(matrix, axis=0), np.max(matrix, axis=0)
 
     @staticmethod
+    def _normalized_archive_matrix(candidates: Sequence, ideal=None, nadir=None):
+        vectors = []
+        for candidate in candidates:
+            objectives = MO_FBSUtil._value(candidate, "mo_objectives_min", None)
+            if objectives is None:
+                continue
+            vectors.append(MO_FBSUtil._as_float_vector(objectives, minimum_size=4, fill_value=0.0)[:4])
+        if not vectors:
+            return np.empty((0, 4), dtype=float), ideal, nadir
+
+        matrix = np.asarray(vectors, dtype=float)
+        if ideal is None or nadir is None:
+            ideal = np.min(matrix, axis=0)
+            nadir = np.max(matrix, axis=0)
+        span = np.maximum(np.asarray(nadir, dtype=float) - np.asarray(ideal, dtype=float), 1e-12)
+        normalized = (matrix - np.asarray(ideal, dtype=float)) / span
+        normalized[~np.isfinite(normalized)] = 0.0
+        normalized = np.clip(normalized, 0.0, None)
+        return normalized, np.asarray(ideal, dtype=float), np.asarray(nadir, dtype=float)
+
+    @staticmethod
+    def _prepare_hv_boxes(lower_points, upper):
+        lower_points = np.asarray(lower_points, dtype=float)
+        upper = np.asarray(upper, dtype=float).reshape(-1)
+        if lower_points.size == 0 or upper.size == 0:
+            return np.empty((0, upper.size), dtype=float), upper
+        if lower_points.ndim == 1:
+            lower_points = lower_points.reshape(1, -1)
+        valid = np.all(np.isfinite(lower_points), axis=1)
+        valid &= np.all(lower_points < upper[None, :], axis=1)
+        if not np.any(valid):
+            return np.empty((0, upper.size), dtype=float), upper
+        clipped = np.clip(lower_points[valid], 0.0, upper[None, :])
+        return clipped, upper
+
+    @staticmethod
+    def _union_hypervolume(lower_points, upper):
+        lower_points, upper = MO_FBSUtil._prepare_hv_boxes(lower_points, upper)
+        if lower_points.size == 0:
+            return 0.0
+
+        dim = int(upper.size)
+        if dim == 1:
+            return float(max(upper[0] - float(np.min(lower_points[:, 0])), 0.0))
+
+        # 递归切片计算并集体积，避免重叠区域被重复计数。
+        boundaries = np.unique(lower_points[:, 0])
+        boundaries = boundaries[boundaries < upper[0]]
+        if boundaries.size == 0:
+            return 0.0
+        boundaries = np.concatenate([boundaries, [upper[0]]])
+
+        volume = 0.0
+        for idx in range(boundaries.size - 1):
+            left = float(boundaries[idx])
+            right = float(boundaries[idx + 1])
+            width = right - left
+            if width <= 1e-15:
+                continue
+            active = lower_points[:, 0] <= left + 1e-15
+            if not np.any(active):
+                continue
+            slice_volume = MO_FBSUtil._union_hypervolume(lower_points[active, 1:], upper[1:])
+            volume += width * slice_volume
+        return float(volume)
+
+    @staticmethod
+    def archive_hypervolume(candidates: Sequence, ideal=None, nadir=None, reference_margin=0.1):
+        normalized, _, _ = MO_FBSUtil._normalized_archive_matrix(candidates, ideal=ideal, nadir=nadir)
+        if normalized.size == 0:
+            return 0.0
+        margin = max(float(reference_margin), 1e-9)
+        reference = np.max(normalized, axis=0) + margin
+        return MO_FBSUtil._union_hypervolume(normalized, reference)
+
+    @staticmethod
+    def archive_spacing(candidates: Sequence, ideal=None, nadir=None):
+        normalized, _, _ = MO_FBSUtil._normalized_archive_matrix(candidates, ideal=ideal, nadir=nadir)
+        count = int(normalized.shape[0])
+        if count <= 1:
+            return 0.0
+        distances = []
+        for idx in range(count):
+            delta = normalized - normalized[idx]
+            norms = np.linalg.norm(delta, axis=1)
+            norms[idx] = np.inf
+            nearest = float(np.min(norms))
+            if np.isfinite(nearest):
+                distances.append(nearest)
+        if not distances:
+            return 0.0
+        distances = np.asarray(distances, dtype=float)
+        mean_distance = float(np.mean(distances))
+        if mean_distance <= 1e-12:
+            return 0.0
+        return float(np.sqrt(np.mean((distances - mean_distance) ** 2)))
+
+    @staticmethod
+    def archive_igd(candidates: Sequence, reference_vectors=None, ideal=None, nadir=None):
+        if not reference_vectors:
+            return None
+        normalized_candidates, ideal, nadir = MO_FBSUtil._normalized_archive_matrix(
+            candidates,
+            ideal=ideal,
+            nadir=nadir,
+        )
+        if normalized_candidates.size == 0:
+            return None
+
+        normalized_reference = []
+        for vector in reference_vectors:
+            normalized = MO_FBSUtil.normalize_objective_vector(vector, ideal=ideal, nadir=nadir)
+            if normalized is None:
+                continue
+            normalized_reference.append(normalized)
+        if not normalized_reference:
+            return None
+        normalized_reference = np.asarray(normalized_reference, dtype=float)
+
+        total = 0.0
+        for reference_vector in normalized_reference:
+            delta = normalized_candidates - reference_vector
+            distance = float(np.min(np.linalg.norm(delta, axis=1)))
+            if not np.isfinite(distance):
+                return None
+            total += distance
+        return float(total / float(len(normalized_reference)))
+
+    @staticmethod
+    def _subset_hypervolume_from_normalized(normalized_vectors, reference_margin=0.1):
+        normalized_vectors = np.asarray(normalized_vectors, dtype=float)
+        if normalized_vectors.size == 0:
+            return 0.0
+        reference = np.max(normalized_vectors, axis=0) + max(float(reference_margin), 1e-9)
+        return MO_FBSUtil._union_hypervolume(normalized_vectors, reference)
+
+    @staticmethod
+    def _subset_spacing_from_normalized(normalized_vectors):
+        normalized_vectors = np.asarray(normalized_vectors, dtype=float)
+        count = int(normalized_vectors.shape[0])
+        if count <= 1:
+            return 0.0
+        distances = []
+        for idx in range(count):
+            delta = normalized_vectors - normalized_vectors[idx]
+            norms = np.linalg.norm(delta, axis=1)
+            norms[idx] = np.inf
+            nearest = float(np.min(norms))
+            if np.isfinite(nearest):
+                distances.append(nearest)
+        if not distances:
+            return 0.0
+        distances = np.asarray(distances, dtype=float)
+        mean_distance = float(np.mean(distances))
+        if mean_distance <= 1e-12:
+            return 0.0
+        return float(np.sqrt(np.mean((distances - mean_distance) ** 2)))
+
+    @staticmethod
     def _duplicate_objectives(left, right, atol=1e-9):
         left_objectives = MO_FBSUtil._value(left, "mo_objectives_min", None)
         right_objectives = MO_FBSUtil._value(right, "mo_objectives_min", None)
@@ -321,7 +502,16 @@ class MO_FBSUtil:
         return bool(np.allclose(left_objectives, right_objectives, atol=atol, rtol=1e-7))
 
     @staticmethod
-    def select_nfcs_subset(candidates: Sequence, max_size: int, ideal=None, nadir=None):
+    def select_nfcs_subset(
+        candidates: Sequence,
+        max_size: int,
+        ideal=None,
+        nadir=None,
+        reference_vectors=None,
+        hv_weight=1.0,
+        igd_weight=0.35,
+        spacing_weight=0.05,
+    ):
         candidates = list(candidates)
         if len(candidates) <= int(max_size):
             return candidates
@@ -369,6 +559,7 @@ class MO_FBSUtil:
                     ideal=ideal,
                     nadir=nadir,
                 )
+                # 主线 MO 保持原始 farthest-first 截断策略。
                 if min_distance > best_distance + 1e-12 or (
                     abs(min_distance - best_distance) <= 1e-12 and score < best_score
                 ):
@@ -407,12 +598,30 @@ class MO_FBSUtil:
         return best_candidate, float(best_key[0]), int(best_index)
 
     @staticmethod
-    def update_pareto_archive(candidates: Sequence, candidate, max_size=None, clone_fn=None, atol=1e-9):
+    def update_pareto_archive(
+        candidates: Sequence,
+        candidate,
+        max_size=None,
+        clone_fn=None,
+        atol=1e-9,
+        quality_gate_when_full=False,
+        quality_hv_tol=1e-10,
+        quality_spacing_tol=1e-8,
+        spacing_guard_when_full=False,
+        spacing_guard_rel_tol=0.0,
+        spacing_guard_hv_gain_rel=0.0,
+        require_candidate_retained=False,
+        ideal=None,
+        nadir=None,
+        reference_vectors=None,
+        quality_igd_tol=1e-8,
+    ):
         archive = [item for item in candidates if MO_FBSUtil.constraint_signature(item)[0]]
         if candidate is None or not MO_FBSUtil.constraint_signature(candidate)[0]:
             return archive, False, 0
 
         clone = copy.deepcopy if clone_fn is None else clone_fn
+        full_before_insert = max_size is not None and len(archive) >= int(max_size)
         kept = []
         removed = 0
         for existing in archive:
@@ -428,6 +637,47 @@ class MO_FBSUtil:
 
         kept.append(clone(candidate))
         if max_size is not None and len(kept) > int(max_size):
-            ideal, nadir = MO_FBSUtil.compute_ideal_nadir(kept)
-            kept = MO_FBSUtil.select_nfcs_subset(kept, int(max_size), ideal=ideal, nadir=nadir)
+            trim_ideal, trim_nadir = MO_FBSUtil.compute_ideal_nadir(kept)
+            kept = MO_FBSUtil.select_nfcs_subset(
+                kept,
+                int(max_size),
+                ideal=trim_ideal,
+                nadir=trim_nadir,
+                reference_vectors=reference_vectors,
+            )
+
+        candidate_retained = any(MO_FBSUtil._duplicate_objectives(candidate, existing, atol=atol) for existing in kept)
+        if bool(require_candidate_retained) and not candidate_retained:
+            # 候选解如果在截断后都无法保留，就不应让它扰动已有档案。
+            return archive, False, 0
+
+        if bool(quality_gate_when_full) and full_before_insert:
+            quality_ideal = ideal
+            quality_nadir = nadir
+            if quality_ideal is None or quality_nadir is None:
+                quality_ideal, quality_nadir = MO_FBSUtil.compute_ideal_nadir(list(archive) + list(kept))
+            before_hv = MO_FBSUtil.archive_hypervolume(archive, ideal=quality_ideal, nadir=quality_nadir)
+            after_hv = MO_FBSUtil.archive_hypervolume(kept, ideal=quality_ideal, nadir=quality_nadir)
+            before_spacing = MO_FBSUtil.archive_spacing(archive, ideal=quality_ideal, nadir=quality_nadir)
+            after_spacing = MO_FBSUtil.archive_spacing(kept, ideal=quality_ideal, nadir=quality_nadir)
+
+            if bool(spacing_guard_when_full) and before_spacing > 1e-12:
+                spacing_rel_worse = (after_spacing - before_spacing) / before_spacing
+                hv_rel_gain = 0.0
+                if before_hv <= 1e-12:
+                    hv_rel_gain = math.inf if after_hv > before_hv + float(quality_hv_tol) else 0.0
+                else:
+                    hv_rel_gain = (after_hv - before_hv) / before_hv
+                if (
+                    spacing_rel_worse > float(spacing_guard_rel_tol)
+                    and hv_rel_gain < float(spacing_guard_hv_gain_rel)
+                ):
+                    return archive, False, 0
+
+            hv_improved = after_hv > before_hv + float(quality_hv_tol)
+            hv_not_worse = after_hv >= before_hv - float(quality_hv_tol)
+            spacing_improved = after_spacing + float(quality_spacing_tol) < before_spacing
+            # 主线 MO 回退为原始门控：优先看 HV，再用 Spacing 作为次级判据。
+            if not (hv_improved or (hv_not_worse and spacing_improved)):
+                return archive, False, 0
         return kept, True, removed

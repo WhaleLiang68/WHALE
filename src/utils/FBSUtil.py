@@ -1,4 +1,4 @@
-import itertools
+﻿import itertools
 import math
 import random
 import gym
@@ -525,6 +525,50 @@ def getCoordinates_mao(fbs_model: FBSModel, area, H):
     return fac_x, fac_y, lengths, widths
 
 
+def getCoordinates_mao_fast(fbs_model: FBSModel, area, H):
+    permutation = np.asarray(fbs_model.permutation, dtype=int)
+    bay = np.asarray(fbs_model.bay, dtype=int)
+    n = permutation.size
+    if n == 0:
+        empty = np.array([], dtype=float)
+        return empty, empty, empty, empty
+    if bay.size != n:
+        zeros = np.zeros(n, dtype=float)
+        return zeros.copy(), zeros.copy(), zeros.copy(), zeros.copy()
+
+    bay_flags = bay.copy()
+    bay_flags[-1] = 1
+    bay_end_idx = np.flatnonzero(bay_flags == 1)
+    bay_start_idx = np.concatenate(([0], bay_end_idx[:-1] + 1))
+    bay_lengths = bay_end_idx - bay_start_idx + 1
+
+    area_array = np.asarray(area, dtype=float)
+    areas_in_perm_order = area_array[permutation - 1]
+    bay_area_sums = np.add.reduceat(areas_in_perm_order, bay_start_idx)
+    bay_widths = bay_area_sums / H
+
+    widths_in_perm_order = np.repeat(bay_widths, bay_lengths)
+    lengths_in_perm_order = areas_in_perm_order / widths_in_perm_order
+
+    bay_x_offsets = np.concatenate(([0.0], np.cumsum(bay_widths[:-1], dtype=float)))
+    fac_x_in_perm_order = np.repeat(bay_x_offsets + bay_widths * 0.5, bay_lengths)
+
+    cumulative_lengths = np.cumsum(lengths_in_perm_order, dtype=float)
+    bay_prefix_lengths = cumulative_lengths[bay_start_idx] - lengths_in_perm_order[bay_start_idx]
+    fac_y_in_perm_order = (
+        cumulative_lengths
+        - lengths_in_perm_order * 0.5
+        - np.repeat(bay_prefix_lengths, bay_lengths)
+    )
+
+    order = np.argsort(permutation)
+    fac_x = fac_x_in_perm_order[order]
+    fac_y = fac_y_in_perm_order[order]
+    lengths = lengths_in_perm_order[order]
+    widths = widths_in_perm_order[order]
+    return fac_x, fac_y, lengths, widths
+
+
 # 计算欧几里得距离矩阵
 def getEuclideanDistances(x, y):
     """计算欧几里得距离矩阵
@@ -779,6 +823,8 @@ def encode_genes_from_solution(permutation, bay):
 def log_action(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
+        if not logging.getLogger().isEnabledFor(logging.DEBUG):
+            return func(*args, **kwargs)
         # 输出方法名
         logging.debug(f"方法名：{func.__name__}")
         logging.debug(
@@ -792,8 +838,675 @@ def log_action(func):
 
     return wrapper
 
-# -------------------------------------------------个体动作开始-------------------------------------------------
-# 交换两个设施
+
+def _copy_bay_structure(bay_structure):
+    return [
+        [
+            int(facility)
+            for facility in (
+                current_bay.tolist() if isinstance(current_bay, np.ndarray) else current_bay
+            )
+        ]
+        for current_bay in bay_structure
+    ]
+
+
+def _build_model_from_encoding(permutation, bay):
+    return FBSModel(
+        permutation.tolist() if isinstance(permutation, np.ndarray) else list(permutation),
+        bay.tolist() if isinstance(bay, np.ndarray) else list(bay),
+    )
+
+
+def _evaluate_candidate_encoding(
+    permutation,
+    bay,
+    area,
+    H,
+    F,
+    fac_limit_aspect,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    model = _build_model_from_encoding(permutation, bay)
+    return evaluate_layout_fast(
+        model,
+        area,
+        H,
+        F,
+        fac_limit_aspect,
+        v_worst=v_worst,
+        k_penalty=k_penalty,
+        distance_metric=distance_metric,
+    )
+
+
+def _evaluate_candidate_encoding_fast(
+    permutation,
+    bay,
+    area,
+    H,
+    F,
+    fac_limit_aspect,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    model = _build_model_from_encoding(permutation, bay)
+    return evaluate_layout_fast(
+        model,
+        area,
+        H,
+        F,
+        fac_limit_aspect,
+        v_worst=v_worst,
+        k_penalty=k_penalty,
+        distance_metric=distance_metric,
+    )
+
+
+def _weighted_choice(values, weights):
+    values = np.asarray(values, dtype=int).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    positive_mask = weights > 0
+    if values.size == 0 or weights.size == 0 or not np.any(positive_mask):
+        return None
+    values = values[positive_mask]
+    weights = weights[positive_mask]
+    probabilities = weights / np.sum(weights)
+    return int(np.random.choice(values, p=probabilities))
+
+
+def flow_guided_swap(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    n = len(permutation)
+    if n < 2:
+        return permutation, bay
+
+    metrics = _evaluate_candidate_encoding(
+        permutation,
+        bay,
+        area,
+        H,
+        F,
+        fac_limit_aspect,
+        v_worst=v_worst,
+        k_penalty=k_penalty,
+        distance_metric=distance_metric,
+    )
+    pair_scores = np.triu(metrics["TM"], 1)
+    pair_indices = np.argwhere(pair_scores > 0)
+    if pair_indices.size == 0:
+        return permutation, bay
+
+    top_k = min(max(3, math.ceil(n / 4)), len(pair_indices))
+    score_values = pair_scores[pair_indices[:, 0], pair_indices[:, 1]]
+    top_positions = np.argpartition(score_values, -top_k)[-top_k:]
+    selected_pair = pair_indices[int(np.random.choice(top_positions))]
+
+    facility_a = int(selected_pair[0] + 1)
+    facility_b = int(selected_pair[1] + 1)
+    pos_a = int(np.where(permutation == facility_a)[0][0])
+    pos_b = int(np.where(permutation == facility_b)[0][0])
+
+    new_perm = permutation.copy()
+    new_perm[pos_a], new_perm[pos_b] = new_perm[pos_b], new_perm[pos_a]
+    return new_perm, bay
+
+
+def segment_insert(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+    if not bay_structure:
+        return permutation, bay
+
+    candidate_pool = []
+    seen = set()
+    top_k = max(3, math.ceil(len(permutation) / 5))
+
+    for bay_idx, current_bay in enumerate(bay_structure):
+        bay_length = len(current_bay)
+        for segment_length in (2, 3):
+            if bay_length <= segment_length:
+                continue
+            for start_idx in range(bay_length - segment_length + 1):
+                segment = current_bay[start_idx : start_idx + segment_length]
+                remaining = (
+                    current_bay[:start_idx] + current_bay[start_idx + segment_length :]
+                )
+                for insert_idx in range(len(remaining) + 1):
+                    candidate_bay = (
+                        remaining[:insert_idx] + segment + remaining[insert_idx:]
+                    )
+                    if candidate_bay == current_bay:
+                        continue
+                    candidate_structure = _copy_bay_structure(bay_structure)
+                    candidate_structure[bay_idx] = candidate_bay
+                    candidate_perm, candidate_bay_flags = arrayToPermutation(
+                        candidate_structure
+                    )
+                    candidate_key = (
+                        tuple(candidate_perm.tolist()),
+                        tuple(candidate_bay_flags.tolist()),
+                    )
+                    if candidate_key in seen:
+                        continue
+                    seen.add(candidate_key)
+                    metrics = _evaluate_candidate_encoding(
+                        candidate_perm,
+                        candidate_bay_flags,
+                        area,
+                        H,
+                        F,
+                        fac_limit_aspect,
+                        v_worst=v_worst,
+                        k_penalty=k_penalty,
+                        distance_metric=distance_metric,
+                    )
+                    if not np.isfinite(metrics["cost"]):
+                        continue
+                    candidate_pool.append(
+                        (
+                            float(metrics["cost"]),
+                            float(metrics["mhc"]),
+                            candidate_perm,
+                            candidate_bay_flags,
+                        )
+                    )
+
+    if not candidate_pool:
+        return permutation, bay
+
+    candidate_pool.sort(key=lambda item: (item[0], item[1]))
+    chosen_idx = int(np.random.randint(0, min(top_k, len(candidate_pool))))
+    _, _, best_perm, best_bay = candidate_pool[chosen_idx]
+    return best_perm, best_bay
+
+
+def cross_bay_relocate(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+    if len(bay_structure) < 2:
+        return permutation, bay
+
+    facility_to_bay = {}
+    for bay_idx, current_bay in enumerate(bay_structure):
+        for facility in current_bay:
+            facility_to_bay[int(facility)] = bay_idx
+
+    candidate_facilities = []
+    facility_weights = []
+    for facility, source_bay_idx in facility_to_bay.items():
+        other_facilities = [
+            other_facility
+            for bay_idx, current_bay in enumerate(bay_structure)
+            if bay_idx != source_bay_idx
+            for other_facility in current_bay
+        ]
+        if not other_facilities:
+            continue
+        cross_flow = float(
+            np.sum(
+                F[
+                    facility - 1,
+                    np.asarray(other_facilities, dtype=int) - 1,
+                ]
+            )
+        )
+        if cross_flow <= 0:
+            continue
+        candidate_facilities.append(int(facility))
+        facility_weights.append(cross_flow)
+
+    selected_facility = _weighted_choice(candidate_facilities, facility_weights)
+    if selected_facility is None:
+        return permutation, bay
+
+    source_bay_idx = facility_to_bay[selected_facility]
+
+    target_bay_ids = []
+    target_bay_weights = []
+    for bay_idx, current_bay in enumerate(bay_structure):
+        if bay_idx == source_bay_idx or len(current_bay) == 0:
+            continue
+        target_flow = float(
+            np.sum(
+                F[
+                    selected_facility - 1,
+                    np.asarray(current_bay, dtype=int) - 1,
+                ]
+            )
+        )
+        if target_flow <= 0:
+            continue
+        target_bay_ids.append(bay_idx)
+        target_bay_weights.append(target_flow)
+
+    target_bay_idx = _weighted_choice(target_bay_ids, target_bay_weights)
+    if target_bay_idx is None:
+        return permutation, bay
+
+    target_bay = bay_structure[target_bay_idx]
+    anchor_flows = np.asarray(
+        [F[selected_facility - 1, facility - 1] for facility in target_bay],
+        dtype=float,
+    )
+    if anchor_flows.size == 0 or np.max(anchor_flows) <= 0:
+        return permutation, bay
+    anchor_candidates = np.asarray(target_bay, dtype=int)[
+        np.isclose(anchor_flows, np.max(anchor_flows))
+    ]
+    anchor_facility = int(np.random.choice(anchor_candidates))
+
+    reduced_structure = []
+    target_new_idx = None
+    for bay_idx, current_bay in enumerate(bay_structure):
+        if bay_idx == source_bay_idx:
+            updated_bay = [
+                facility
+                for facility in current_bay
+                if facility != selected_facility
+            ]
+        else:
+            updated_bay = list(current_bay)
+
+        if not updated_bay:
+            continue
+        if bay_idx == target_bay_idx:
+            target_new_idx = len(reduced_structure)
+        reduced_structure.append(updated_bay)
+
+    if target_new_idx is None:
+        return permutation, bay
+
+    candidate_pool = []
+    anchor_position = reduced_structure[target_new_idx].index(anchor_facility)
+    for insert_offset in (0, 1):
+        candidate_structure = _copy_bay_structure(reduced_structure)
+        target_list = list(candidate_structure[target_new_idx])
+        target_list.insert(anchor_position + insert_offset, selected_facility)
+        candidate_structure[target_new_idx] = target_list
+
+        candidate_perm, candidate_bay_flags = arrayToPermutation(candidate_structure)
+        metrics = _evaluate_candidate_encoding(
+            candidate_perm,
+            candidate_bay_flags,
+            area,
+            H,
+            F,
+            fac_limit_aspect,
+            v_worst=v_worst,
+            k_penalty=k_penalty,
+            distance_metric=distance_metric,
+        )
+        if not np.isfinite(metrics["cost"]):
+            continue
+        candidate_pool.append(
+            (
+                float(metrics["cost"]),
+                float(metrics["mhc"]),
+                candidate_perm,
+                candidate_bay_flags,
+            )
+        )
+
+    if not candidate_pool:
+        return permutation, bay
+
+    candidate_pool.sort(key=lambda item: (item[0], item[1]))
+    _, _, best_perm, best_bay = candidate_pool[0]
+    return best_perm, best_bay
+
+
+def bay_split_by_flow(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    """Split the bay whose weakest cut has the smallest cross-flow."""
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    flow = np.asarray(F, dtype=float)
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+
+    best_bay_idx = None
+    best_split_idx = None
+    min_cross_flow = float("inf")
+
+    for bay_idx, current_bay in enumerate(bay_structure):
+        if len(current_bay) < 2:
+            continue
+        for split_idx in range(1, len(current_bay)):
+            left = current_bay[:split_idx]
+            right = current_bay[split_idx:]
+            cross_flow = float(
+                sum(
+                    flow[int(left_facility) - 1, int(right_facility) - 1]
+                    + flow[int(right_facility) - 1, int(left_facility) - 1]
+                    for left_facility in left
+                    for right_facility in right
+                )
+            )
+            if cross_flow < min_cross_flow:
+                min_cross_flow = cross_flow
+                best_bay_idx = bay_idx
+                best_split_idx = split_idx
+
+    if best_bay_idx is None:
+        return permutation, bay
+
+    selected_bay = list(bay_structure[best_bay_idx])
+    bay_structure[best_bay_idx] = selected_bay[:best_split_idx]
+    bay_structure.insert(best_bay_idx + 1, selected_bay[best_split_idx:])
+    return arrayToPermutation(bay_structure)
+
+
+def bay_merge_by_flow(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    """Merge the adjacent bay pair with the strongest cross-flow."""
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    flow = np.asarray(F, dtype=float)
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+    if len(bay_structure) < 2:
+        return permutation, bay
+
+    best_bay_idx = None
+    max_cross_flow = -1.0
+    for bay_idx in range(len(bay_structure) - 1):
+        left = bay_structure[bay_idx]
+        right = bay_structure[bay_idx + 1]
+        cross_flow = float(
+            sum(
+                flow[int(left_facility) - 1, int(right_facility) - 1]
+                + flow[int(right_facility) - 1, int(left_facility) - 1]
+                for left_facility in left
+                for right_facility in right
+            )
+        )
+        if cross_flow > max_cross_flow:
+            max_cross_flow = cross_flow
+            best_bay_idx = bay_idx
+
+    if best_bay_idx is None:
+        return permutation, bay
+
+    merged_bay = list(bay_structure[best_bay_idx]) + list(
+        bay_structure[best_bay_idx + 1]
+    )
+    bay_structure[best_bay_idx] = merged_bay
+    bay_structure.pop(best_bay_idx + 1)
+    return arrayToPermutation(bay_structure)
+
+
+def adjacent_bay_repartition_by_flow(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    """Re-cut the boundary of a high-flow adjacent bay pair."""
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    flow = np.asarray(F, dtype=float)
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+    if len(bay_structure) < 2:
+        return permutation, bay
+
+    pair_candidates = []
+    for bay_idx in range(len(bay_structure) - 1):
+        left = bay_structure[bay_idx]
+        right = bay_structure[bay_idx + 1]
+        if len(left) + len(right) < 2:
+            continue
+        cross_flow = float(
+            sum(
+                flow[int(left_facility) - 1, int(right_facility) - 1]
+                + flow[int(right_facility) - 1, int(left_facility) - 1]
+                for left_facility in left
+                for right_facility in right
+            )
+        )
+        pair_candidates.append((bay_idx, cross_flow))
+
+    if not pair_candidates:
+        return permutation, bay
+
+    pair_candidates.sort(key=lambda item: item[1], reverse=True)
+    top_pair_candidates = pair_candidates[: min(3, len(pair_candidates))]
+    pair_indices = [item[0] for item in top_pair_candidates]
+    pair_weights = [max(float(item[1]), 0.0) for item in top_pair_candidates]
+
+    selected_pair_idx = _weighted_choice(pair_indices, pair_weights)
+    if selected_pair_idx is None:
+        selected_pair_idx = int(
+            np.random.choice(np.asarray(pair_indices, dtype=int))
+        )
+
+    merged_sequence = list(bay_structure[selected_pair_idx]) + list(
+        bay_structure[selected_pair_idx + 1]
+    )
+    if len(merged_sequence) < 2:
+        return permutation, bay
+
+    candidate_pool = []
+    for split_idx in range(1, len(merged_sequence)):
+        candidate_structure = _copy_bay_structure(bay_structure)
+        candidate_structure[selected_pair_idx] = merged_sequence[:split_idx]
+        candidate_structure[selected_pair_idx + 1] = merged_sequence[split_idx:]
+
+        candidate_perm, candidate_bay_flags = arrayToPermutation(candidate_structure)
+        metrics = _evaluate_candidate_encoding(
+            candidate_perm,
+            candidate_bay_flags,
+            area,
+            H,
+            F,
+            fac_limit_aspect,
+            v_worst=v_worst,
+            k_penalty=k_penalty,
+            distance_metric=distance_metric,
+        )
+        if not np.isfinite(metrics["cost"]):
+            continue
+        candidate_pool.append(
+            (
+                float(metrics["cost"]),
+                float(metrics["mhc"]),
+                candidate_perm,
+                candidate_bay_flags,
+            )
+        )
+
+    if not candidate_pool:
+        return permutation, bay
+
+    candidate_pool.sort(key=lambda item: (item[0], item[1]))
+    chosen_idx = int(np.random.randint(0, min(3, len(candidate_pool))))
+    _, _, best_perm, best_bay = candidate_pool[chosen_idx]
+    return best_perm, best_bay
+
+
+def adjacent_bay_block_repartition_by_flow(
+    permutation,
+    bay,
+    area,
+    H,
+    F=None,
+    fac_limit_aspect=None,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    """Repartition a high-flow adjacent bay pair with small boundary block swaps."""
+    permutation = np.asarray(permutation, dtype=int).copy()
+    bay = np.asarray(bay, dtype=int).copy()
+    flow = np.asarray(F, dtype=float)
+    bay_structure = _copy_bay_structure(permutationToArray(permutation, bay))
+    if len(bay_structure) < 2:
+        return permutation, bay
+
+    pair_candidates = []
+    for bay_idx in range(len(bay_structure) - 1):
+        left = bay_structure[bay_idx]
+        right = bay_structure[bay_idx + 1]
+        if len(left) + len(right) < 2:
+            continue
+        cross_flow = float(
+            sum(
+                flow[int(left_facility) - 1, int(right_facility) - 1]
+                + flow[int(right_facility) - 1, int(left_facility) - 1]
+                for left_facility in left
+                for right_facility in right
+            )
+        )
+        pair_candidates.append((bay_idx, cross_flow))
+
+    if not pair_candidates:
+        return permutation, bay
+
+    pair_candidates.sort(key=lambda item: item[1], reverse=True)
+    top_pair_candidates = pair_candidates[: min(3, len(pair_candidates))]
+    pair_indices = [item[0] for item in top_pair_candidates]
+    pair_weights = [max(float(item[1]), 0.0) for item in top_pair_candidates]
+
+    selected_pair_idx = _weighted_choice(pair_indices, pair_weights)
+    if selected_pair_idx is None:
+        selected_pair_idx = int(
+            np.random.choice(np.asarray(pair_indices, dtype=int))
+        )
+
+    left = list(bay_structure[selected_pair_idx])
+    right = list(bay_structure[selected_pair_idx + 1])
+    merged_sequence = left + right
+    if len(merged_sequence) < 2:
+        return permutation, bay
+
+    candidate_pool = []
+    seen_encodings = set()
+
+    def _append_candidate(candidate_structure):
+        candidate_perm, candidate_bay_flags = arrayToPermutation(candidate_structure)
+        key = (
+            tuple(int(v) for v in np.asarray(candidate_perm, dtype=int).tolist()),
+            tuple(int(v) for v in np.asarray(candidate_bay_flags, dtype=int).tolist()),
+        )
+        if key in seen_encodings:
+            return
+        seen_encodings.add(key)
+        metrics = _evaluate_candidate_encoding(
+            candidate_perm,
+            candidate_bay_flags,
+            area,
+            H,
+            F,
+            fac_limit_aspect,
+            v_worst=v_worst,
+            k_penalty=k_penalty,
+            distance_metric=distance_metric,
+        )
+        if not np.isfinite(metrics["cost"]):
+            return
+        candidate_pool.append(
+            (
+                float(metrics["cost"]),
+                float(metrics["mhc"]),
+                candidate_perm,
+                candidate_bay_flags,
+            )
+        )
+
+    for split_idx in range(1, len(merged_sequence)):
+        candidate_structure = _copy_bay_structure(bay_structure)
+        candidate_structure[selected_pair_idx] = merged_sequence[:split_idx]
+        candidate_structure[selected_pair_idx + 1] = merged_sequence[split_idx:]
+        _append_candidate(candidate_structure)
+
+    max_left_block = min(3, len(left))
+    max_right_block = min(3, len(right))
+    for left_block_size in range(1, max_left_block + 1):
+        left_prefix = left[:-left_block_size]
+        left_suffix = left[-left_block_size:]
+        for right_block_size in range(1, max_right_block + 1):
+            right_prefix = right[:right_block_size]
+            right_suffix = right[right_block_size:]
+            new_left = left_prefix + right_prefix
+            new_right = left_suffix + right_suffix
+            if not new_left or not new_right:
+                continue
+            candidate_structure = _copy_bay_structure(bay_structure)
+            candidate_structure[selected_pair_idx] = new_left
+            candidate_structure[selected_pair_idx + 1] = new_right
+            _append_candidate(candidate_structure)
+
+    if not candidate_pool:
+        return permutation, bay
+
+    candidate_pool.sort(key=lambda item: (item[0], item[1]))
+    chosen_idx = int(np.random.randint(0, min(3, len(candidate_pool))))
+    _, _, best_perm, best_bay = candidate_pool[chosen_idx]
+    return best_perm, best_bay
+
+
+def is_feasible_eq34(fac_b, fac_h, area, fac_limit_aspect):
+    d_inf, _, _, _, _ = calculate_d_inf(fac_b, fac_h, area, fac_limit_aspect)
+    return d_inf == 0
+
+
 @log_action
 def facility_swap(permutation: np.ndarray, bay: np.ndarray):
     """交换两个设施"""
@@ -1614,3 +2327,183 @@ def constructState(fac_x, fac_y, fac_b, fac_h, W, L, fbsModel, TM):
         # 填充颜色到对应区域
         data[y_start:y_end, x_start:x_end, :] = [R[i], G[i], B[i]]
     return data
+
+
+# Modern fitness helpers used by ELP/DataExtractor.
+def get_instance_aspect_limit(fac_limit_aspect) -> float:
+    aspect_limits = np.asarray(fac_limit_aspect, dtype=float).reshape(-1)
+    if aspect_limits.size == 0:
+        return 99.0
+    finite_limits = aspect_limits[np.isfinite(aspect_limits)]
+    if finite_limits.size == 0:
+        return 99.0
+    return float(np.max(finite_limits))
+
+
+def _normalize_aspect_limits(fac_limit_aspect, facility_count: int) -> np.ndarray:
+    aspect_limits = np.asarray(fac_limit_aspect, dtype=float).reshape(-1)
+    if aspect_limits.size == 0:
+        aspect_limits = np.full(facility_count, 99.0, dtype=float)
+    elif aspect_limits.size == 1:
+        aspect_limits = np.full(facility_count, float(aspect_limits[0]), dtype=float)
+    elif aspect_limits.size != facility_count:
+        raise ValueError(
+            f"Aspect limit count {aspect_limits.size} does not match facility count {facility_count}."
+        )
+    return np.clip(aspect_limits, 1.0 + 1e-12, None)
+
+
+def calculate_eq34_bounds(area, fac_limit_aspect):
+    areas = np.asarray(area, dtype=float).reshape(-1)
+    aspect_limits = _normalize_aspect_limits(fac_limit_aspect, len(areas))
+    lower_bounds = np.sqrt(areas / aspect_limits)
+    upper_bounds = np.sqrt(areas * aspect_limits)
+    return lower_bounds, upper_bounds, aspect_limits
+
+
+def calculate_d_inf(fac_b, fac_h, area, fac_limit_aspect):
+    widths = np.asarray(fac_b, dtype=float).reshape(-1)
+    heights = np.asarray(fac_h, dtype=float).reshape(-1)
+    short_side = np.minimum(widths, heights)
+    long_side = np.maximum(widths, heights)
+    lower_bounds, upper_bounds, aspect_limits = calculate_eq34_bounds(area, fac_limit_aspect)
+    infeasible_mask = (short_side < lower_bounds) | (long_side > upper_bounds)
+    d_inf = int(np.sum(infeasible_mask))
+    return d_inf, infeasible_mask, lower_bounds, upper_bounds, aspect_limits
+
+
+def calculate_cost(mhc, fac_b, fac_h, area, fac_limit_aspect, v_worst=None, k_penalty=1):
+    d_inf, infeasible_mask, lower_bounds, upper_bounds, aspect_limits = calculate_d_inf(
+        fac_b, fac_h, area, fac_limit_aspect
+    )
+    widths = np.asarray(fac_b, dtype=float).reshape(-1)
+    heights = np.asarray(fac_h, dtype=float).reshape(-1)
+    short_side = np.minimum(widths, heights)
+    long_side = np.maximum(widths, heights)
+    short_violation = np.maximum(lower_bounds - short_side, 0.0)
+    long_violation = np.maximum(long_side - upper_bounds, 0.0)
+    violation_sum = float(np.sum(short_violation + long_violation))
+    mhc_value = float(mhc)
+    if d_inf == 0:
+        cost = mhc_value
+    elif v_worst is None or not np.isfinite(v_worst) or float(v_worst) <= 0:
+        cost = float("inf")
+    else:
+        cost = mhc_value + (d_inf ** int(k_penalty)) * float(v_worst)
+    return {
+        "cost": cost,
+        "d_inf": d_inf,
+        "infeasible_mask": infeasible_mask,
+        "lower_bounds": lower_bounds,
+        "upper_bounds": upper_bounds,
+        "aspect_limits": aspect_limits,
+        "violation_sum": violation_sum,
+    }
+
+
+def evaluate_layout(
+    fbs_model: FBSModel,
+    area,
+    H,
+    F,
+    fac_limit_aspect,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    fac_x, fac_y, fac_b, fac_h = getCoordinates_mao(fbs_model, area, H)
+    min_side = np.minimum(fac_b, fac_h)
+    fac_aspect_ratio = np.divide(
+        np.maximum(fac_b, fac_h),
+        min_side,
+        out=np.full_like(np.asarray(fac_b, dtype=float), np.inf, dtype=float),
+        where=min_side > 0,
+    )
+    if distance_metric == "euclidean":
+        D = getEuclideanDistances(fac_x, fac_y)
+    else:
+        D = getManhattanDistances(fac_x, fac_y)
+    TM = getTransportIntensity(D, F)
+    mhc = float(np.sum(TM))
+    cost_data = calculate_cost(
+        mhc,
+        fac_b,
+        fac_h,
+        area,
+        fac_limit_aspect,
+        v_worst=v_worst,
+        k_penalty=k_penalty,
+    )
+    return {
+        "fac_x": fac_x,
+        "fac_y": fac_y,
+        "fac_b": fac_b,
+        "fac_h": fac_h,
+        "fac_aspect_ratio": fac_aspect_ratio,
+        "D": D,
+        "TM": TM,
+        "mhc": mhc,
+        "cost": cost_data["cost"],
+        "d_inf": cost_data["d_inf"],
+        "infeasible_mask": cost_data["infeasible_mask"],
+        "lower_bounds": cost_data["lower_bounds"],
+        "upper_bounds": cost_data["upper_bounds"],
+        "aspect_limits": cost_data["aspect_limits"],
+        "violation_sum": cost_data["violation_sum"],
+        "is_feasible": cost_data["d_inf"] == 0,
+        "v_worst": None if v_worst is None else float(v_worst),
+    }
+
+
+def evaluate_layout_fast(
+    fbs_model: FBSModel,
+    area,
+    H,
+    F,
+    fac_limit_aspect,
+    v_worst=None,
+    k_penalty=1,
+    distance_metric="manhattan",
+):
+    fac_x, fac_y, fac_b, fac_h = getCoordinates_mao_fast(fbs_model, area, H)
+    min_side = np.minimum(fac_b, fac_h)
+    fac_aspect_ratio = np.divide(
+        np.maximum(fac_b, fac_h),
+        min_side,
+        out=np.full_like(np.asarray(fac_b, dtype=float), np.inf, dtype=float),
+        where=min_side > 0,
+    )
+    if distance_metric == "euclidean":
+        D = getEuclideanDistances(fac_x, fac_y)
+    else:
+        D = getManhattanDistances(fac_x, fac_y)
+    TM = getTransportIntensity(D, F)
+    mhc = float(np.sum(TM))
+    cost_data = calculate_cost(
+        mhc,
+        fac_b,
+        fac_h,
+        area,
+        fac_limit_aspect,
+        v_worst=v_worst,
+        k_penalty=k_penalty,
+    )
+    return {
+        "fac_x": fac_x,
+        "fac_y": fac_y,
+        "fac_b": fac_b,
+        "fac_h": fac_h,
+        "fac_aspect_ratio": fac_aspect_ratio,
+        "D": D,
+        "TM": TM,
+        "mhc": mhc,
+        "cost": cost_data["cost"],
+        "d_inf": cost_data["d_inf"],
+        "infeasible_mask": cost_data["infeasible_mask"],
+        "lower_bounds": cost_data["lower_bounds"],
+        "upper_bounds": cost_data["upper_bounds"],
+        "aspect_limits": cost_data["aspect_limits"],
+        "violation_sum": cost_data["violation_sum"],
+        "is_feasible": cost_data["d_inf"] == 0,
+        "v_worst": None if v_worst is None else float(v_worst),
+    }

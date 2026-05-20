@@ -1,0 +1,164 @@
+===== PAGE 4 =====
+large-scale instances. Ahmadi-Javid et al. ( 2021 ) focused
+FBS for UA-FLP with objective of ﬁnding the best shortest
+single loop. They developed a hybrid algorithm based on
+Memetic and SA, where the former decided bay layouts,and the latter determined the corresponding single loop for
+each bay layout. The hybrid algorithm efﬁciently handled
+large-scale instances of this bi-level optimization problem.
+For other meta-heuristics, Tam ( 1992b ) implemented a
+fundamental GA and provided a set of test instances to
+evaluate its performance. Those instances gained widely
+usage in subsequent studies. Palomo-Romero et al. ( 2017 )
+proposed an Island Model GA (IMGA) that incorporatedparallel evolution of sub-populations, enabling an expan-
+sion of the sampling space. Kultruel-Konak and Konak
+(2011 ) applied ACO with FBS (ACO-FBS). To promote
+diversity, they introduced a delay in updating pheromone
+values for unvisited solutions. Kang and Chae ( 2017 ) uti-
+lized a basic HS framework but modiﬁed it by reducing theSTS representation to a smaller-sized vector. In addition,
+they redeﬁned the penalty scheme, prioritizing solutions
+with fewer violations.
+In recent years, numerous novel meta-heuristics have
+emerged to address UA-FLPs. For example, Kim and Chae
+(2021 ) introduced a redesigned of the discrete operators for
+Monarch Butterﬂy Optimization (MBO). They also incor-
+porated a greedy acceptance mechanism to accelerate the
+search process with STS representation. Garcı ´a-Herna ´ndez
+and his colleagues proposed a serial of CROs for UA-FLP.
+Initially, they presented a fundamental algorithmic frame-
+work to solve UA-FLP with FBS (Garcı ´a-Herna ´ndez et al.
+2019 ). Subsequently, they developed an island model
+approach that included crossover operators and mutation
+operators (Garcı ´a-Herna ´ndez et al. 2020b ). In their work on
+CRO with substrate layers (CRO-SL) (Garcı ´a-Herna ´ndez
+et al. 2020a ), candidate solutions were shared across dif-
+ferent layers. By employing the aforementioned operators,the algorithm explored the search space in a parallel
+manner.
+Despite the existence of numerous proposed algorithms
+and meticulously designed structural representations, there
+is still signiﬁcant room for improvement. Many existing
+studies focus on designing speciﬁc local search operatorstailored to their respective algorithms, with limited explo-
+ration of hybrid operators. In addition, the challenge of
+effectively tracking the performance of hybrid local searchoperators in a timely manner based on the current search
+state remains unresolved. Another challenge lies in the
+signiﬁcant potential for enhancement in terms of accuracyand execution time. Moreover, in practical applications, it
+is often necessary to achieve an optimal outcome within a
+reasonable execution time, leading to a trade-off betweencost and beneﬁt. Building upon these considerations, the
+objective of this paper is to propose a more practicalsolution that addresses real-world scenarios more
+effectively.
+3 Problem formulation
+To tackle the UA-FLP using a meta-heuristic algorithmframework, it is essential to establish a suitable objective
+function and solution representation. This section intro-
+duces the mathematical deﬁnition of UA-FLP, a proposedobjective function, and the encoding of the layout repre-
+sentation based on FBS.
+3.1 Problem description
+The UA-FLP contains nfacilities within a rectangular area.
+The total area, denoted as A, occupied by nfacilities must
+not exceed the product of the width ( W) and height ( H)o f
+the given two-dimensional area (Armour and Buffa 1963 ).
+The parameters and variables are listed in Table 1. The
+constraint is presented in Eq. 2:
+Xn
+iAi/C20W/C2H ð2Þ
+Each facility must adhere to the following constraints:
+(1) All facilities should remain within the designated
+region. This means the total width and height of all facil-
+ities should be less than WandH. (2) Each facility must
+satisfy a shape constraint, which can be deﬁned as a
+maximum aspect ratio or a minimum side length. Typi-
+cally, the constraint conditions of facilities are maximumproportion constraint and minimum limit constraint. (3) All
+facilities should not overlap with each other. The con-
+straints formal descriptions are presented as follows:
+maxwi
+hi;hi
+wi/C26/C27
+/C20ari ð3Þ
+min wi;hi fg /C21lmin ð4Þ
+Xy
+r¼xzr
+ijþzr
+ji/C16/C17
+¼1 ð5Þ
+zr
+ij2f0;1g;8i;j6¼i;r ð6Þ
+cr
+iþlr
+i
+2/C20cr
+j/C0lr
+j
+2þLr1/C0zr
+ij/C16/C17
+;8i;j6¼i;s ð7Þ
+lr
+i
+2/C20cr
+i/C20Lr/C0lr
+i
+2;8i;r ð8Þ
+Equation 3is the maximum proportion constraint and it
+denotes that the ratio of height hiand width wiof the
+facility should be less than or equal to the given aspect
+ratio ari. Equation 4shows the minimum limit constraint
+that the width wior height hiof the facility should be5670 J. Lin et al.
+123
+===== PAGE 5 =====
+greater than or equal to the given value lmin. These con-
+straints prevent overstretching of facility shapes and ensure
+that they remain consistent with real-world scenarios.
+Equations 5–8deﬁne the feasible range for facility loca-
+tions, while Eqs. 7and 8further speciﬁcally address the
+prevention of overlap between facilities.
+Furthermore, in this study, only the material handling
+cost between facilities is considered. To handle infeasible
+solutions, a penalty value is incorporated. This penalty
+value helps guide the optimization process towards feasiblesolutions. The overall objective function for the UA-FLP is
+designed as follows:Cost
+min¼Xn
+iXn
+jfijdijþDinfðÞkVworst ð9Þ
+The distance dijis either Euclidean distance or Man-
+hattan distance according on various facility instance. Dinf
+is the number of unfeasible facilities, calculated using
+Eqs. 3and4.kis a penalty coefﬁcient. Vworst is the worst
+value of all currently feasible solutions. In the originalpenalty item, this portion is calculated as the difference
+between the current best solution and the known best
+solution (Tate and Smith 1995 ). When the algorithm gets
+trapped in a local optimum, the latter portion of the value
+remains unchanged. In addition, k= 3 imposes stricter
+requirements on the number of constrain violations, mak-ing it less likely to include valuable information from the
+infeasible solution. Therefore, we utilized V
+worst as the
+replacement value. Correspondingly, we have set k=1
+instead of 3. Using a smaller value for k, we aim to enhance
+the conveyance of beneﬁcial information hidden within
+infeasible solutions.
+3.2 Encoding of UA-FLP on FBS with bay list
+The FBS representation consists of two main parts. A
+rectangular plant is divided in one direction into several
+parallel bays, each with varying widths or heights. Withineach bay, multiple facilities of the same width or height are
+arranged. The general encoding for FBS typically contains
+two components: the facility sequence which includes thefacility numbers, and the bay division which consists of 1 s
+or 0 s indicating whether a facility is the last one in its
+corresponding bay.
+In Fig. 1, an example of a speciﬁc solution is presented.
+Figure 1a illustrates the facility layout, where Fig. 1bTable 1 Parameters and variables
+Parameters and variables
+n The number of facilities
+wi The width of the facility i
+hi The height of the facility i
+ai The ratio of the facility i
+r Thexorydirection
+zx
+ij 1, when the facility iis to the left of j
+0, otherwise
+zy
+ij1, when the facility iis lower than j
+0, otherwise
+L Thexorysize of ﬂoor space
+lr
+i Thexorysize of the facility i
+fij The material ﬂow between facility iandj
+dij The distance between facility iandj
+Fig. 1 A layout representation
+with FBSLearning-based simulated annealing algorithm for unequal area facility layout problem 5671
+123

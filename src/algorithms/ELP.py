@@ -12,10 +12,31 @@ from loguru import logger
 from src.utils.FBSModel import FBSModel
 import src.utils.ExperimentsUtil as ExperimentsUtil
 # from src.algorithms.RL.Q_Learning import QLearningAgent, evaluate_policy
-
+np.bool8 = np.bool_
 
 class ELP:
-    def __init__(self, env, gbest, T, Q_matrix, G=100, t_max=50, k=10,bin_width=10.0):
+    def __init__(
+        self,
+        env,
+        gbest,
+        T,
+        Q_matrix,
+        G=100,
+        t_max=50,
+        k=10,
+        bin_width=10.0,
+        adaptive_bin_width=False,
+        bin_width_recent_window=4000,
+        bin_width_target_bins=64,
+        bin_width_lower_ratio=2e-5,
+        bin_width_upper_ratio=2e-3,
+        bin_width_fallback_ratio=2e-4,
+        bin_width_min_abs=10.0,
+        bin_width_refresh_interval=200,
+        adaptive_bin_width_strategy="spread",
+        bin_width_scale_ratio=5e-6,
+        bin_width_change_tolerance=0.05,
+    ):
         """
         ELP算法初始化（遵循图片中算法输入参数定义）
         参数:
@@ -40,6 +61,7 @@ class ELP:
         # 初始化当前解和能量（E(s)用适应度表示，与原代码fitness逻辑一致）
         self.s = copy.deepcopy(gbest)
         self.current_energy = self._calculate_energy(self.s)
+        self.current_search_energy = self._calculate_search_energy(self.s)
         self.best_energy = self.current_energy  # 记录最优能量（对应原代码best_fitness）
 
         self.true_best=self.s
@@ -54,11 +76,37 @@ class ELP:
         # 设定直方图的“箱宽” (Bin Width)
         # 这个参数很重要：决定了多大范围内的能量被视为“同一个坑”
         # 对于你的问题(5000左右的量级)，设为 1.0 或 10.0 比较合适
-        self.bin_width = bin_width
+        self.bin_width = float(bin_width)
+        self.adaptive_bin_width = bool(adaptive_bin_width)
+        self.bin_width_recent_window = max(200, int(bin_width_recent_window))
+        self.bin_width_target_bins = max(16, int(bin_width_target_bins))
+        self.bin_width_lower_ratio = max(1e-8, float(bin_width_lower_ratio))
+        self.bin_width_upper_ratio = max(
+            self.bin_width_lower_ratio * 2.0,
+            float(bin_width_upper_ratio),
+        )
+        self.bin_width_fallback_ratio = max(
+            self.bin_width_lower_ratio,
+            float(bin_width_fallback_ratio),
+        )
+        self.bin_width_min_abs = max(1.0, float(bin_width_min_abs))
+        self.bin_width_refresh_interval = max(1, int(bin_width_refresh_interval))
+        self.adaptive_bin_width_strategy = str(adaptive_bin_width_strategy).strip().lower() or "spread"
+        if self.adaptive_bin_width_strategy not in {"spread", "scale", "hybrid"}:
+            raise ValueError(
+                f"未知的自适应分箱策略: {adaptive_bin_width_strategy!r}，"
+                "可选值为 spread、scale、hybrid。"
+            )
+        self.bin_width_scale_ratio = max(1e-9, float(bin_width_scale_ratio))
+        self.bin_width_change_tolerance = max(0.0, float(bin_width_change_tolerance))
+        self.search_energy_history = []
+        self.bin_width_history = [float(self.bin_width)]
         # 记录 gbest 下降趋势
         self.best_history = [self.best_energy]
         self.gbest_plot_path = None
         self.gbest_update_count = 0
+        # 限制非有限能量告警次数，避免实验日志被刷屏
+        self.non_finite_energy_warning_count = 0
 
     def _calculate_energy(self, solution):
         """计算解的能量E(s)（图片中算法核心指标，映射原代码fitness）
@@ -74,11 +122,48 @@ class ELP:
 
     def _get_bin_index(self, energy):
         """将连续的能量值转换为整数索引（分箱）"""
-        return int(energy / self.bin_width)
+        energy_value = float(energy)
+        if not np.isfinite(energy_value):
+            return None
+        return int(energy_value / self.bin_width)
+
+    def _calculate_search_energy(self, solution):
+        """计算搜索阶段使用的有限代理能量，避免不可行解返回 inf 后搜索停滞。"""
+        raw_energy = float(self._calculate_energy(solution))
+        if np.isfinite(raw_energy):
+            return raw_energy
+
+        d_inf = getattr(solution, "current_d_inf", None)
+        mhc = getattr(solution, "MHC", getattr(solution, "mhc", None))
+        if d_inf is None or mhc is None:
+            return np.inf
+
+        mhc_value = float(mhc)
+        if not np.isfinite(mhc_value):
+            return np.inf
+
+        penalty_anchor = getattr(solution, "best_feasible_cost", np.inf)
+        if penalty_anchor is None or not np.isfinite(float(penalty_anchor)) or float(penalty_anchor) <= 0:
+            # 尚未见到可行解时，用当前 MHC 的量级构造一个稳定的大惩罚项，
+            # 让算法优先降低 d_inf，再在同一 d_inf 下比较 MHC。
+            penalty_anchor = max(abs(mhc_value), 1.0) * 10.0
+
+        return float(mhc_value) + float(max(int(d_inf), 1)) * float(penalty_anchor)
+
+    def _warn_non_finite_energy(self, energy, context):
+        """记录非有限能量告警，帮助定位不可行解阶段的问题。"""
+        if self.non_finite_energy_warning_count < 10:
+            logger.warning(
+                f"{context}时检测到非有限能量 {energy}，本次跳过直方图分箱并按 H=0 处理。"
+            )
+        self.non_finite_energy_warning_count += 1
 
     def _update_histogram(self, energy):
         """更新直方图：当前能量对应的计数 +1"""
         idx = self._get_bin_index(energy)
+        if idx is None:
+            self._warn_non_finite_energy(energy, "更新直方图")
+            return
         if idx not in self.energy_histogram:
             self.energy_histogram[idx] = 0
         self.energy_histogram[idx] += 1
@@ -86,7 +171,113 @@ class ELP:
     def _get_H_value(self, energy):
         """获取当前能量对应的 H 值（访问次数）"""
         idx = self._get_bin_index(energy)
+        if idx is None:
+            self._warn_non_finite_energy(energy, "读取H值")
+            return 0
         return self.energy_histogram.get(idx, 0)
+
+    def _get_histogram_reference_energy(self):
+        """获取自适应分箱使用的能量量级参考。"""
+        if np.isfinite(float(self.best_energy)):
+            return float(self.best_energy)
+        return np.inf
+
+    def _get_bin_width_bounds(self, reference_energy):
+        """根据当前目标值量级给出自适应箱宽的上下界。"""
+        if not np.isfinite(reference_energy):
+            return float(self.bin_width), float(self.bin_width), float(self.bin_width)
+
+        energy_scale = max(abs(float(reference_energy)), 1.0)
+        min_width = max(float(self.bin_width_min_abs), energy_scale * float(self.bin_width_lower_ratio))
+        max_width = max(min_width, energy_scale * float(self.bin_width_upper_ratio))
+        fallback_width = max(min_width, energy_scale * float(self.bin_width_fallback_ratio))
+        return min_width, max_width, fallback_width
+
+    def _clamp_bin_width(self, width, reference_energy):
+        """把候选箱宽限制在当前实例尺度允许的范围内。"""
+        min_width, max_width, _ = self._get_bin_width_bounds(reference_energy)
+        if not np.isfinite(width) or float(width) <= 0:
+            return float(min_width)
+        return float(min(max(float(width), min_width), max_width))
+
+    def _clamp_scale_bin_width(self, width, reference_energy):
+        """按比例缩放策略的箱宽边界；允许低于 spread 策略的比例下界。"""
+        if not np.isfinite(reference_energy):
+            return float(self.bin_width)
+        energy_scale = max(abs(float(reference_energy)), 1.0)
+        min_width = max(1.0, float(self.bin_width_min_abs))
+        max_width = max(min_width, energy_scale * float(self.bin_width_upper_ratio))
+        if not np.isfinite(width) or float(width) <= 0:
+            return float(min_width)
+        return float(min(max(float(width), min_width), max_width))
+
+    def _get_spread_adaptive_bin_width(self, reference_energy):
+        """按近期能量分布跨度估计箱宽；这是旧版 adaptive 的逻辑。"""
+        if not np.isfinite(reference_energy):
+            return float(self.bin_width)
+
+        min_width, max_width, fallback_width = self._get_bin_width_bounds(reference_energy)
+
+        finite_history = [
+            float(value)
+            for value in self.search_energy_history[-int(self.bin_width_recent_window):]
+            if np.isfinite(value)
+        ]
+        if len(finite_history) >= 32:
+            q10, q90 = np.percentile(np.asarray(finite_history, dtype=float), [10, 90])
+            spread = max(float(q90) - float(q10), 0.0)
+            if spread > 0:
+                candidate_width = spread / float(max(1, int(self.bin_width_target_bins)))
+                if np.isfinite(candidate_width) and candidate_width > 0:
+                    return float(min(max(candidate_width, min_width), max_width))
+
+        return float(min(max(fallback_width, min_width), max_width))
+
+    def _get_scale_adaptive_bin_width(self, reference_energy):
+        """按最优目标值量级估计箱宽，避免不同规模算例需要手工固定 bin_width。"""
+        if not np.isfinite(reference_energy):
+            return float(self.bin_width)
+        energy_scale = max(abs(float(reference_energy)), 1.0)
+        candidate_width = energy_scale * float(self.bin_width_scale_ratio)
+        return self._clamp_scale_bin_width(candidate_width, reference_energy)
+
+    def _get_adaptive_bin_width(self, reference_energy):
+        """根据配置策略估计能量分箱宽度。"""
+        if self.adaptive_bin_width_strategy == "spread":
+            return self._get_spread_adaptive_bin_width(reference_energy)
+        if self.adaptive_bin_width_strategy == "scale":
+            return self._get_scale_adaptive_bin_width(reference_energy)
+
+        spread_width = self._get_spread_adaptive_bin_width(reference_energy)
+        scale_width = self._get_scale_adaptive_bin_width(reference_energy)
+        # 旧 spread 策略容易把 Du62 的箱宽放大到几百/几千，导致 H 过度粗粒度。
+        # hybrid 取两者中更细的估计，保留跨规模缩放能力，同时限制过粗分箱。
+        return self._clamp_scale_bin_width(min(spread_width, scale_width), reference_energy)
+
+    def _refresh_adaptive_bin_width(self):
+        """刷新自适应分箱，并用新的 bin_width 重建访问直方图。"""
+        if not self.adaptive_bin_width:
+            return False
+
+        new_bin_width = self._get_adaptive_bin_width(self._get_histogram_reference_energy())
+        if not np.isfinite(new_bin_width) or new_bin_width <= 0:
+            return False
+        relative_change = abs(float(new_bin_width) - float(self.bin_width)) / max(abs(float(self.bin_width)), 1e-12)
+        if relative_change <= float(self.bin_width_change_tolerance):
+            return False
+
+        self.bin_width = float(new_bin_width)
+        rebuilt_histogram = {}
+        for energy in self.search_energy_history:
+            if not np.isfinite(energy):
+                continue
+            idx = self._get_bin_index(float(energy))
+            if idx is None:
+                continue
+            rebuilt_histogram[idx] = rebuilt_histogram.get(idx, 0) + 1
+        self.energy_histogram = rebuilt_histogram
+        self.bin_width_history.append(float(self.bin_width))
+        return True
 
     def _calculate_H(self, current_E, t):
         """计算H(E(s),t)函数（图片中能量修正项，此处实现基于迭代步的衰减函数）
@@ -175,6 +366,7 @@ class ELP:
             # 顺便把当前 ELP 的搜索点 (self.s) 也拉过去，加速收敛
             self.s = copy.deepcopy(self.gbest)
             self.current_energy = self.best_energy
+            self.current_search_energy = self._calculate_search_energy(self.s)
 
     def _plot_gbest_trend(self):
         """绘制并保存 gbest 下降趋势图"""
@@ -357,6 +549,7 @@ class ELP:
         fast_time = start_time  # 记录首次找到最优解的时间
         g = 0  # 外层循环计数器（算法中g从1开始）
         # 初始化解
+        self._refresh_adaptive_bin_width()
 
         while g < self.G:  # 外层循环：g < G（图片中算法外层循环条件）
             t = 0  # 内层循环计数器（算法中t从1开始）
@@ -375,14 +568,17 @@ class ELP:
                 # E_s = self.current_energy
                 E_s = self._calculate_energy(self.s)
                 self.current_energy = E_s
+                search_E_s = self._calculate_search_energy(self.s)
+                self.current_search_energy = search_E_s
                 # penalty_factor = self.current_energy * 0.05
                 penalty_factor = self.k
                 E_s_prime = self._calculate_energy(s_prime)
-                H_s = self._get_H_value(E_s)
-                H_s_prime = self._get_H_value(E_s_prime)
+                search_E_s_prime = self._calculate_search_energy(s_prime)
+                H_s = self._get_H_value(search_E_s)
+                H_s_prime = self._get_H_value(search_E_s_prime)
                 # 3. 计算修正后的能量（图片中E'(s) = E(s) + k*H(E(s),t)）
-                E_prime_s = E_s + penalty_factor * H_s
-                E_prime_s_prime = E_s_prime + penalty_factor * H_s_prime
+                E_prime_s = search_E_s + penalty_factor * H_s
+                E_prime_s_prime = search_E_s_prime + penalty_factor * H_s_prime
                 # 4. 接受准则（图片中"若I()<E)rp() tcn"修正为标准Metropolis准则，基于能量差）
                 delta_E_prime = E_prime_s_prime - E_prime_s  # 修正能量差
                 # 定义玻尔兹曼常数（单位：J/K）
@@ -393,10 +589,13 @@ class ELP:
                     prob = 1.0
                     accept = True
                 else:
-                    exponent = -delta_E_prime / (self.T * k_boltzmann + 1e-10)
-                    prob = math.exp(exponent)
-                    if np.random.rand() < prob:
-                        accept = True
+                    if np.isfinite(delta_E_prime):
+                        exponent = -delta_E_prime / (self.T * k_boltzmann + 1e-10)
+                        prob = math.exp(exponent)
+                        if np.random.rand() < prob:
+                            accept = True
+                    else:
+                        prob = 0.0
                 self.prob_history.append(prob)
                 if accept:
                     # 接受新解...
@@ -407,6 +606,7 @@ class ELP:
                     # 接受新解：更新当前解和当前能量
                     self.s = s_prime
                     self.current_energy = E_s_prime
+                    self.current_search_energy = search_E_s_prime
                     # 5. 更新全局最优解gbest（图片中"更新gbest"步骤）
                     if self.current_energy < self.best_energy:
                         self.gbest = copy.deepcopy(self.s)
@@ -421,14 +621,22 @@ class ELP:
                 # self._update_histogram(self.current_energy)
                 current_total_step = g * self.t_max + t
                 total_steps = self.G * self.t_max
+
+                if (
+                    self.adaptive_bin_width
+                    and current_total_step > 0
+                    and current_total_step % self.bin_width_refresh_interval == 0
+                ):
+                    self._refresh_adaptive_bin_width()
     
                 if current_total_step < 0.8 * total_steps:
-                    self._update_histogram(self.current_energy)
-                H=self._get_H_value(self.current_energy)
-                current_step_modified_energy = self.current_energy + penalty_factor * H
+                    self._update_histogram(self.current_search_energy)
+                H=self._get_H_value(self.current_search_energy)
+                current_step_modified_energy = self.current_search_energy + penalty_factor * H
                 self.modified_energy_history.append(current_step_modified_energy)
                 # 6. 更新H(E(s),t)（图片中步骤，此处H随t动态计算，无需额外存储）
                 # 7. 内循环步数+1（图片中"令t=t+1"）
+                self.search_energy_history.append(self.current_search_energy)
                 self.energy_history.append(self.current_energy)
                 t += 1
 
@@ -472,7 +680,7 @@ class ELP:
 
 if __name__ == "__main__":
     # 实验参数
-    exp_instance = "AB20-ar3"
+    exp_instance = "Du62"
     exp_algorithm = "ELP"  # 算法名称改为ELP
     exp_remark = "k=15*T/T_initial,bin_width=5,后期冻结直方图,t_max = 300,G=2000,getfitness2，修复了贪婪操作，修改repair，g_best=5396.6，惩罚指数：1至5,step05（facility_insert），最优贪婪0-4"
     exp_number = 50
@@ -496,6 +704,47 @@ if __name__ == "__main__":
                 env = gym.make("FbsEnv-v0", instance=exp_instance)
                 env.reset()  # 重置环境获取初始合法解
                 initial_gbest = env  # 初始gbest为环境初始解
+                base_env=env
+                # ========================================================
+                if "AB20" in str(exp_instance):
+                    try:
+                        custom_tm = np.loadtxt(
+                            r"C:\Users\17122\PycharmProjects\pythonProject\ua-flp-LSA2\data\AB20(1963).csv",
+                            delimiter=",", encoding="utf-8-sig")
+                        if hasattr(base_env, 'F'):
+                            base_env.F = custom_tm.copy()
+                        if hasattr(base_env, 'TM'):
+                            base_env.TM = custom_tm.copy()
+                        logger.info(f"检测到实例名包含 AB20 ({exp_instance})，已成功从 AB20(1963).csv 覆盖自定义物流量！")
+                    except Exception as e:
+                        logger.error(f"加载自定义物流量失败: {e}")
+                if "SC30" in str(exp_instance):
+                    try:
+                        custom_tm = np.loadtxt(
+                            r"C:\Users\17122\PycharmProjects\pythonProject\ua-flp-LSA2\data\SC30_Flow_Matrix.csv",
+                            delimiter=",", encoding="utf-8-sig")
+                        if hasattr(base_env, 'F'):
+                            base_env.F = custom_tm.copy()
+                        if hasattr(base_env, 'TM'):
+                            base_env.TM = custom_tm.copy()
+                        logger.info(
+                            f"检测到实例名包含 SC30 ({exp_instance})，已成功从 SC30_Flow_Matrix.csv 覆盖自定义物流量！")
+                    except Exception as e:
+                        logger.error(f"加载自定义物流量失败: {e}")
+                if "SC35" in str(exp_instance):
+                    try:
+                        custom_tm = np.loadtxt(
+                            r"C:\Users\17122\PycharmProjects\pythonProject\ua-flp-LSA2\data\SC35_Flow_Matrix.csv",
+                            delimiter=",", encoding="utf-8-sig")
+                        if hasattr(base_env, 'F'):
+                            base_env.F = custom_tm.copy()
+                        if hasattr(base_env, 'TM'):
+                            base_env.TM = custom_tm.copy()
+                        logger.info(
+                            f"检测到实例名包含 SC35 ({exp_instance})，已成功从 SC35_Flow_Matrix.csv 覆盖自定义物流量！")
+                    except Exception as e:
+                        logger.error(f"加载自定义物流量失败: {e}")
+                # ========================================================
 
                 # 2. 实例化ELP算法（传入图片要求的所有输入参数）
                 elp_solver = ELP(
@@ -538,7 +787,7 @@ if __name__ == "__main__":
                 print(f"重置后解: {env.fbs_model.permutation, env.fbs_model.bay}, 能量: {env.fitness}")
 
             except Exception as e:
-                logger.error(f"第{i + 1}次实验失败！错误信息: {str(e)}")
+                logger.exception(f"第{i + 1}次实验失败！错误信息: {str(e)}")
     else:
         # 单次实验
         env = gym.make("FbsEnv-v0", instance=exp_instance)

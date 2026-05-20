@@ -13,16 +13,130 @@ import src
 import src.utils.ExperimentsUtil as ExperimentsUtil
 import src.utils.FBSUtil as FBSUtil
 import src.utils.MO_ExperimentsUtil as MO_ExperimentsUtil
+import src.utils.MO_ReferenceFrontUtil as MO_ReferenceFrontUtil
 import src.utils.config as config
 from src.utils.FBSModel import FBSModel
 from src.algorithms.ELP_DRL_Standard import ELP as StandardELP
 from src.algorithms.ELP_DRL_Standard import StandardDQNAgent
 from src.algorithms.ELP_DRL_Standard import StandardQLearningAgent
 from src.algorithms.ELP_DRL_Standard import _get_initial_solution_energy
+from src.algorithms.ELP_DRL_Standard import _set_global_seed
 from src.utils.MO_DataGenerator import MO_DataGenerator
 from src.utils.MO_FBSUtil import MO_FBSUtil
 
+_PYMOO_IMPORT_ERROR = None
+
+try:
+    from pymoo.algorithms.moo.moead import MOEAD
+    from pymoo.algorithms.moo.nsga2 import NSGA2
+    from pymoo.algorithms.moo.spea2 import SPEA2, SPEA2Survival
+    from pymoo.core.crossover import Crossover
+    from pymoo.core.mutation import Mutation
+    from pymoo.core.problem import Problem
+    from pymoo.core.sampling import Sampling
+    from pymoo.optimize import minimize
+    from pymoo.termination import get_termination
+    from pymoo.util.ref_dirs import get_reference_directions
+except Exception as exc:
+    MOEAD = None
+    NSGA2 = None
+    SPEA2 = None
+    SPEA2Survival = None
+    Crossover = object
+    Mutation = object
+    Problem = object
+    Sampling = object
+    minimize = None
+    get_termination = None
+    get_reference_directions = None
+    _PYMOO_IMPORT_ERROR = exc
+
 np.bool8 = np.bool_
+
+
+class _ActionSequenceSampling(Sampling):
+    def _do(self, problem, n_samples, **kwargs):
+        n_samples = int(max(1, n_samples))
+        lower = np.asarray(problem.xl, dtype=int)
+        upper = np.asarray(problem.xu, dtype=int)
+        random_values = np.random.randint(lower[None, :], upper[None, :] + 1, size=(n_samples, problem.n_var))
+        return random_values.astype(int)
+
+
+class _ActionSequenceUniformCrossover(Crossover):
+    def __init__(self, swap_prob=0.5):
+        super().__init__(2, 2)
+        self.swap_prob = float(np.clip(swap_prob, 0.0, 1.0))
+
+    def _do(self, problem, X, **kwargs):
+        n_matings = int(X.shape[1])
+        n_var = int(X.shape[2])
+        parent_a = X[0].astype(int)
+        parent_b = X[1].astype(int)
+        swap_mask = np.random.rand(n_matings, n_var) < self.swap_prob
+        child_a = np.where(swap_mask, parent_b, parent_a)
+        child_b = np.where(swap_mask, parent_a, parent_b)
+        return np.stack([child_a, child_b], axis=0).astype(int)
+
+
+class _ActionSequenceMutation(Mutation):
+    def __init__(self, mutation_prob=None):
+        super().__init__()
+        self.mutation_prob = mutation_prob
+
+    def _do(self, problem, X, **kwargs):
+        values = np.asarray(X, dtype=int).copy()
+        rows, cols = values.shape
+        per_gene_prob = self.mutation_prob
+        if per_gene_prob is None:
+            per_gene_prob = 1.0 / float(max(1, problem.n_var))
+        per_gene_prob = float(np.clip(per_gene_prob, 0.0, 1.0))
+        mutate_mask = np.random.rand(rows, cols) < per_gene_prob
+        if np.any(mutate_mask):
+            lower = np.asarray(problem.xl, dtype=int)[None, :]
+            upper = np.asarray(problem.xu, dtype=int)[None, :]
+            random_values = np.random.randint(lower, upper + 1, size=(rows, cols))
+            values[mutate_mask] = random_values[mutate_mask]
+        return values
+
+
+class _ActionSequenceMOProblem(Problem):
+    def __init__(self, solver, base_solution, sequence_length, use_constraints=True):
+        self.solver = solver
+        self.base_solution = solver._light_clone_solution(base_solution)
+        self.action_count = int(len(solver.valid_actions))
+        self.use_constraints = bool(use_constraints)
+        super().__init__(
+            n_var=int(max(1, sequence_length)),
+            n_obj=4,
+            n_ieq_constr=2 if self.use_constraints else 0,
+            xl=np.zeros(int(max(1, sequence_length)), dtype=int),
+            xu=np.full(int(max(1, sequence_length)), self.action_count - 1, dtype=int),
+            vtype=int,
+        )
+
+    def _evaluate(self, X, out, *args, **kwargs):
+        sequences = np.asarray(X, dtype=int)
+        sample_count = int(sequences.shape[0])
+        objectives = np.zeros((sample_count, 4), dtype=float)
+        constraints = np.zeros((sample_count, 2), dtype=float)
+        for idx in range(sample_count):
+            candidate = self.solver._evaluate_action_sequence(self.base_solution, sequences[idx])
+            objective_vector = np.asarray(candidate.mo_objectives_min, dtype=float)[:4]
+            is_feasible = bool(getattr(candidate, "current_is_feasible", False))
+            d_inf = int(getattr(candidate, "current_d_inf", 0) or 0)
+            violation = max(float(getattr(candidate, "constraint_violation", 0.0) or 0.0), 0.0)
+            if self.use_constraints:
+                objectives[idx, :] = objective_vector
+                constraints[idx, 0] = 0.0 if is_feasible else 1.0
+                constraints[idx, 1] = violation
+            else:
+                # MOEA/D 在 pymoo 中不支持显式约束，改为统一罚函数保持可行性优先。
+                penalty = 0.0 if is_feasible else (1_000_000.0 + 10_000.0 * max(d_inf, 0) + violation)
+                objectives[idx, :] = objective_vector + float(penalty)
+        out["F"] = objectives
+        if self.use_constraints:
+            out["G"] = constraints
 
 
 class ELP(StandardELP):
@@ -56,8 +170,124 @@ class ELP(StandardELP):
         self.mo_run_summary = None
         self.mo_worst_feasible_mhc = None
         self._last_transition_meta = {}
+        self.wall_time_limit_seconds = max(
+            0.0,
+            float(os.getenv("ELP_WALL_TIME_LIMIT_SECONDS", "0") or 0.0),
+        )
         self.mo_trace_interval = int(max(1, int(os.getenv("ELP_MO_TRACE_INTERVAL", "1000"))))
         self.agent_mode = None
+        self.mo_nondominated_accept_cap_high = float(os.getenv("ELP_MO_ND_ACCEPT_CAP_HIGH", "0.90"))
+        self.mo_nondominated_accept_cap_low = float(os.getenv("ELP_MO_ND_ACCEPT_CAP_LOW", "0.08"))
+        self.mo_nondominated_accept_cap_low = max(0.0, min(self.mo_nondominated_accept_cap_low, 1.0))
+        self.mo_nondominated_accept_cap_high = max(0.0, min(self.mo_nondominated_accept_cap_high, 1.0))
+        if self.mo_nondominated_accept_cap_high < self.mo_nondominated_accept_cap_low:
+            self.mo_nondominated_accept_cap_high = self.mo_nondominated_accept_cap_low
+        # 非支配接受率分段参数：前期保探索，后期收敛
+        self.mo_nondominated_accept_cap_early_floor = float(os.getenv("ELP_MO_ND_ACCEPT_CAP_EARLY_FLOOR", "0.55"))
+        self.mo_nondominated_accept_cap_mid_floor = float(os.getenv("ELP_MO_ND_ACCEPT_CAP_MID_FLOOR", "0.25"))
+        self.mo_nondominated_accept_cap_late_max_start = float(
+            os.getenv("ELP_MO_ND_ACCEPT_CAP_LATE_MAX_START", "0.35")
+        )
+        self.mo_nondominated_accept_cap_late_max_end = float(
+            os.getenv("ELP_MO_ND_ACCEPT_CAP_LATE_MAX_END", "0.18")
+        )
+        self.mo_nondominated_accept_cap_early_floor = max(
+            self.mo_nondominated_accept_cap_low,
+            min(self.mo_nondominated_accept_cap_early_floor, self.mo_nondominated_accept_cap_high),
+        )
+        self.mo_nondominated_accept_cap_mid_floor = max(
+            self.mo_nondominated_accept_cap_low,
+            min(self.mo_nondominated_accept_cap_mid_floor, self.mo_nondominated_accept_cap_high),
+        )
+        self.mo_nondominated_accept_cap_late_max_start = max(
+            self.mo_nondominated_accept_cap_low,
+            min(self.mo_nondominated_accept_cap_late_max_start, self.mo_nondominated_accept_cap_high),
+        )
+        self.mo_nondominated_accept_cap_late_max_end = max(
+            self.mo_nondominated_accept_cap_low,
+            min(self.mo_nondominated_accept_cap_late_max_end, self.mo_nondominated_accept_cap_high),
+        )
+        if self.mo_nondominated_accept_cap_late_max_start < self.mo_nondominated_accept_cap_late_max_end:
+            self.mo_nondominated_accept_cap_late_max_start = self.mo_nondominated_accept_cap_late_max_end
+        # 后段“非入档候选”门控：仅对互不支配且不改档案的候选降接受概率
+        self.mo_late_nonarchive_gate_start = float(os.getenv("ELP_MO_LATE_NOARCHIVE_GATE_START", "0.88"))
+        self.mo_late_nonarchive_prob_scale_end = float(os.getenv("ELP_MO_LATE_NOARCHIVE_PROB_SCALE_END", "0.70"))
+        self.mo_late_nonarchive_prob_cap_start = float(os.getenv("ELP_MO_LATE_NOARCHIVE_PROB_CAP_START", "0.50"))
+        self.mo_late_nonarchive_prob_cap_end = float(os.getenv("ELP_MO_LATE_NOARCHIVE_PROB_CAP_END", "0.28"))
+        self.mo_late_nonarchive_stagnation_windows = int(
+            max(1, int(os.getenv("ELP_MO_LATE_NOARCHIVE_STAGNATION_WINDOWS", "4")))
+        )
+        self.mo_late_nonarchive_stagnation_ramp_windows = int(
+            max(
+                1,
+                int(
+                    os.getenv(
+                        "ELP_MO_LATE_NOARCHIVE_STAGNATION_RAMP_WINDOWS",
+                        str(self.mo_late_nonarchive_stagnation_windows),
+                    )
+                ),
+            )
+        )
+        self.mo_late_nonarchive_stagnation_min_progress = float(
+            os.getenv("ELP_MO_LATE_NOARCHIVE_STAGNATION_MIN_PROGRESS", "0.70")
+        )
+        self.mo_late_nonarchive_gate_enabled = self._parse_env_flag(
+            "ELP_MO_LATE_NOARCHIVE_GATE_ENABLE",
+            False,
+        )
+        self.mo_late_nonarchive_gate_start = min(max(self.mo_late_nonarchive_gate_start, 0.0), 1.0)
+        self.mo_late_nonarchive_prob_scale_end = min(max(self.mo_late_nonarchive_prob_scale_end, 0.0), 1.0)
+        self.mo_late_nonarchive_prob_cap_start = min(max(self.mo_late_nonarchive_prob_cap_start, 0.0), 1.0)
+        self.mo_late_nonarchive_prob_cap_end = min(max(self.mo_late_nonarchive_prob_cap_end, 0.0), 1.0)
+        self.mo_late_nonarchive_stagnation_min_progress = min(
+            max(self.mo_late_nonarchive_stagnation_min_progress, 0.0),
+            1.0,
+        )
+        if self.mo_late_nonarchive_prob_cap_start < self.mo_late_nonarchive_prob_cap_end:
+            self.mo_late_nonarchive_prob_cap_start = self.mo_late_nonarchive_prob_cap_end
+        self.local_search_cooldown_steps = int(max(1, int(os.getenv("ELP_MO_LOCAL_SEARCH_COOLDOWN", "24"))))
+        self.local_search_min_rel_improvement = max(
+            0.0,
+            float(os.getenv("ELP_MO_LOCAL_SEARCH_MIN_REL_IMPROVE", "0.01")),
+        )
+        self.local_search_disable_after_progress = float(os.getenv("ELP_MO_LOCAL_SEARCH_DISABLE_AFTER", "0.80"))
+        self.local_search_disable_after_progress = min(max(self.local_search_disable_after_progress, 0.0), 1.0)
+        self.last_local_search_step = -10**9
+        self.local_search_backoff_enable = self._parse_env_flag("ELP_MO_LOCAL_SEARCH_BACKOFF_ENABLE", True)
+        self.local_search_backoff_exp_cap = int(max(0, int(os.getenv("ELP_MO_LOCAL_SEARCH_BACKOFF_EXP_CAP", "4"))))
+        self.local_search_cooldown_max_steps = int(
+            max(
+                self.local_search_cooldown_steps,
+                int(
+                    os.getenv(
+                        "ELP_MO_LOCAL_SEARCH_COOLDOWN_MAX",
+                        str(self.local_search_cooldown_steps * 16),
+                    )
+                ),
+            )
+        )
+        self.archive_quality_gate_when_full = self._parse_env_flag("ELP_MO_ARCHIVE_QUALITY_GATE", True)
+        self.archive_quality_hv_tol = max(0.0, float(os.getenv("ELP_MO_ARCHIVE_HV_TOL", "1e-10")))
+        self.archive_quality_spacing_tol = max(0.0, float(os.getenv("ELP_MO_ARCHIVE_SPACING_TOL", "1e-8")))
+        self.archive_quality_igd_tol = max(0.0, float(os.getenv("ELP_MO_ARCHIVE_IGD_TOL", "1e-8")))
+        self.archive_spacing_guard_when_full = self._parse_env_flag("ELP_MO_ARCHIVE_SPACING_GUARD", True)
+        self.archive_spacing_guard_rel_tol = max(0.0, float(os.getenv("ELP_MO_ARCHIVE_SPACING_GUARD_REL_TOL", "0.20")))
+        self.archive_spacing_guard_hv_gain_rel = max(0.0, float(os.getenv("ELP_MO_ARCHIVE_SPACING_GUARD_HV_GAIN_REL", "0.02")))
+        self.archive_require_candidate_retained = self._parse_env_flag("ELP_MO_ARCHIVE_REQUIRE_RETAINED", True)
+        self.archive_reference_front_enabled = self._parse_env_flag("ELP_MO_ARCHIVE_REFERENCE_ENABLE", True)
+        self.archive_reference_front_payload = None
+        self.archive_reference_vectors = []
+        self.archive_fixed_hv_reference_margin = max(
+            0.0,
+            float(os.getenv("ELP_MO_ARCHIVE_FIXED_HV_MARGIN", "0.1")),
+        )
+
+        self.mo_elite_multi_anchor_enabled = self._parse_env_flag("ELP_MO_ELITE_MULTI_ANCHOR_ENABLE", True)
+        self.mo_elite_anchor_count = int(max(1, int(os.getenv("ELP_MO_ELITE_ANCHOR_COUNT", "3"))))
+        self.mo_elite_sparse_anchor_count = int(max(0, int(os.getenv("ELP_MO_ELITE_SPARSE_ANCHOR_COUNT", "1"))))
+        self.mo_elite_include_representative = self._parse_env_flag("ELP_MO_ELITE_INCLUDE_REPRESENTATIVE", True)
+        self.mo_elite_include_extremes = self._parse_env_flag("ELP_MO_ELITE_INCLUDE_EXTREMES", True)
+        self.mo_elite_include_sparse = self._parse_env_flag("ELP_MO_ELITE_INCLUDE_SPARSE", True)
 
         facility_count = int(getattr(base_env, "n", len(getattr(base_env, "areas", [])) or 0))
         self.rel_matrix, self.dist_req_matrix = MO_DataGenerator.load_or_generate_data(
@@ -71,6 +301,19 @@ class ELP(StandardELP):
         self.action_labels[10] = "fast_segment_insert"
         if 10 in self.action_telemetry:
             self.action_telemetry[10]["name"] = "fast_segment_insert"
+        self._refresh_archive_reference_front()
+
+    @staticmethod
+    def _parse_env_flag(name, default):
+        raw_value = os.getenv(name)
+        if raw_value is None:
+            return bool(default)
+        normalized = str(raw_value).strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
 
     @staticmethod
     def _copy_bay_structure(bay_structure):
@@ -93,6 +336,196 @@ class ELP(StandardELP):
         if not np.isfinite(value):
             return None
         return float(value)
+
+    def _elapsed_seconds_since(self, start_time):
+        if start_time is None:
+            return None
+        return (datetime.datetime.now() - start_time).total_seconds()
+
+    def _wall_time_limit_reached(self, start_time):
+        limit_seconds = float(getattr(self, "wall_time_limit_seconds", 0.0) or 0.0)
+        if limit_seconds <= 0.0:
+            return False
+        elapsed_seconds = self._elapsed_seconds_since(start_time)
+        return elapsed_seconds is not None and elapsed_seconds >= limit_seconds
+
+    def _refresh_archive_reference_front(self, force_rebuild=False):
+        if not bool(getattr(self, "archive_reference_front_enabled", False)):
+            self.archive_reference_front_payload = None
+            self.archive_reference_vectors = []
+            return None
+        payload = MO_ReferenceFrontUtil.ensure_instance_reference_front(
+            self.instance_name,
+            result_root=config.RESULT_PATH,
+            force_rebuild=bool(force_rebuild),
+        )
+        self.archive_reference_front_payload = payload
+        self.archive_reference_vectors = [
+            np.asarray(item.get("moObjectivesMin"), dtype=float)
+            for item in (payload.get("items") or [])
+            if isinstance(item, dict) and item.get("moObjectivesMin") is not None
+        ]
+        return payload
+
+    def _compute_reference_front_metrics(self):
+        reference_payload = self._refresh_archive_reference_front(force_rebuild=True)
+        archive_hypervolume = self._compute_fixed_reference_hypervolume(
+            reference_payload=reference_payload,
+            strict=True,
+        )
+        archive_spacing = self._compute_reference_front_spacing(
+            reference_payload=reference_payload,
+            strict=True,
+        )
+        archive_igd = self._safe_float(
+            MO_ReferenceFrontUtil.compute_archive_igd(self.pareto_archive, reference_payload)
+        )
+        return {
+            "archive_hypervolume": archive_hypervolume,
+            "archive_spacing": archive_spacing,
+            "archive_igd": archive_igd,
+            "reference_front_path": None if reference_payload is None else str(reference_payload.get("referenceFrontPath") or ""),
+            "reference_front_size": None if reference_payload is None else int(reference_payload.get("referenceFrontSize") or 0),
+            "reference_front_archive_count": None if reference_payload is None else int(reference_payload.get("sourceArchiveCount") or 0),
+            "archive_hypervolume_mode": "fixed_reference_front",
+            "archive_hypervolume_reference_point": [
+                1.0 + float(getattr(self, "archive_fixed_hv_reference_margin", 0.1) or 0.0)
+            ] * 4,
+        }
+
+    def _reference_front_ideal_nadir(self, reference_payload, strict=False):
+        if not reference_payload:
+            if strict:
+                raise RuntimeError("公共参考前沿为空，无法计算固定口径 HV/Spacing。")
+            return None, None
+
+        ideal = reference_payload.get("ideal")
+        nadir = reference_payload.get("nadir")
+        if ideal is None or nadir is None:
+            if strict:
+                raise RuntimeError("公共参考前沿缺少 ideal/nadir，无法计算固定口径 HV/Spacing。")
+            return None, None
+
+        ideal = np.asarray(ideal, dtype=float).reshape(-1)
+        nadir = np.asarray(nadir, dtype=float).reshape(-1)
+        if ideal.size < 4 or nadir.size < 4 or not np.all(np.isfinite(ideal[:4])) or not np.all(np.isfinite(nadir[:4])):
+            if strict:
+                raise RuntimeError("公共参考前沿 ideal/nadir 非法，无法计算固定口径 HV/Spacing。")
+            return None, None
+        return ideal[:4], nadir[:4]
+
+    def _compute_fixed_reference_hypervolume(self, archive=None, reference_payload=None, strict=False):
+        archive = self.pareto_archive if archive is None else archive
+        ideal, nadir = self._reference_front_ideal_nadir(reference_payload, strict=strict)
+        if ideal is None or nadir is None:
+            return None
+        normalized, _, _ = MO_FBSUtil._normalized_archive_matrix(archive, ideal=ideal, nadir=nadir)
+        if normalized.size == 0:
+            return 0.0
+        margin = float(getattr(self, "archive_fixed_hv_reference_margin", 0.1) or 0.0)
+        reference_point = np.full(int(normalized.shape[1]), 1.0 + margin, dtype=float)
+        return self._safe_float(MO_FBSUtil._union_hypervolume(normalized, reference_point))
+
+    def _compute_reference_front_spacing(self, archive=None, reference_payload=None, strict=False):
+        archive = self.pareto_archive if archive is None else archive
+        ideal, nadir = self._reference_front_ideal_nadir(reference_payload, strict=strict)
+        if ideal is None or nadir is None:
+            return None
+        return self._safe_float(MO_FBSUtil.archive_spacing(archive, ideal=ideal, nadir=nadir))
+
+    def _current_best_metric_label(self):
+        return 'representative decision score'
+
+    def _extra_training_progress_text(self):
+        if not getattr(self, "pareto_archive", None):
+            return ''
+
+        def _fmt_metric(value):
+            return 'NA' if value is None else f'{value:.6f}'
+
+        archive_hv = self._compute_fixed_reference_hypervolume(
+            reference_payload=self.archive_reference_front_payload,
+            strict=False,
+        )
+        archive_spacing = self._compute_reference_front_spacing(
+            reference_payload=self.archive_reference_front_payload,
+            strict=False,
+        )
+        archive_igd = self._safe_float(
+            MO_ReferenceFrontUtil.compute_archive_igd(
+                self.pareto_archive,
+                self.archive_reference_front_payload,
+            )
+        )
+        return (
+            f" | HV: {_fmt_metric(archive_hv)}"
+            f" | IGD: {_fmt_metric(archive_igd)}"
+            f" | Spacing: {_fmt_metric(archive_spacing)}"
+        )
+
+    def _reference_vectors_for_archive(self):
+        vectors = list(getattr(self, "archive_reference_vectors", []) or [])
+        return vectors if vectors else None
+
+    def _append_unique_elite_anchor(self, anchors, candidate):
+        if candidate is None:
+            return
+        if not getattr(candidate, "current_is_feasible", False) or not np.isfinite(getattr(candidate, "fitness", np.inf)):
+            return
+        candidate_vector = getattr(candidate, "mo_objectives_min", None)
+        for existing in anchors:
+            if MO_FBSUtil._duplicate_objectives(candidate, existing):
+                return
+        anchors.append(copy.deepcopy(candidate))
+
+    def _elite_sparse_archive_candidates(self, count):
+        if int(count) <= 0 or len(self.pareto_archive) <= 1:
+            return []
+        normalized, _, _ = MO_FBSUtil._normalized_archive_matrix(
+            self.pareto_archive,
+            ideal=self.mo_ideal,
+            nadir=self.mo_nadir,
+        )
+        if normalized.shape[0] <= 1:
+            return []
+        rows = []
+        for idx in range(normalized.shape[0]):
+            delta = normalized - normalized[idx]
+            norms = np.linalg.norm(delta, axis=1)
+            norms[idx] = np.inf
+            nearest = float(np.min(norms))
+            rows.append((nearest, idx))
+        rows.sort(key=lambda item: item[0], reverse=True)
+        return [self.pareto_archive[idx] for _, idx in rows[: int(count)]]
+
+    def _build_elite_anchor_pool(self):
+        anchors = []
+        self._append_unique_elite_anchor(anchors, self.best_feasible_solution)
+        if bool(getattr(self, "mo_elite_include_representative", True)):
+            self._append_unique_elite_anchor(anchors, self.representative_solution)
+
+        if self.pareto_archive:
+            if bool(getattr(self, "mo_elite_include_extremes", True)):
+                for objective_idx in range(4):
+                    extreme_candidate = min(
+                        self.pareto_archive,
+                        key=lambda item: float(getattr(item, "mo_objectives_min", [math.inf] * 4)[objective_idx]),
+                    )
+                    self._append_unique_elite_anchor(anchors, extreme_candidate)
+            if bool(getattr(self, "mo_elite_include_sparse", True)):
+                for sparse_candidate in self._elite_sparse_archive_candidates(self.mo_elite_sparse_anchor_count):
+                    self._append_unique_elite_anchor(anchors, sparse_candidate)
+
+        anchors.sort(
+            key=lambda item: (
+                float(getattr(item, "decision_score", math.inf)),
+                float(getattr(item, "fitness", math.inf)),
+            )
+        )
+        return anchors[: int(max(1, self.mo_elite_anchor_count))]
+
+    def _elite_intensification(self, fast_time):
+        return super()._elite_intensification(fast_time)
 
     @staticmethod
     def _make_trace_bucket():
@@ -132,6 +565,8 @@ class ELP(StandardELP):
         self._current_action_context = {}
         self._last_archive_observation = {"archive_changed": False, "rep_changed": False}
         self._last_loss_value = None
+        self._last_effective_archive_change_step = 0
+        self.local_search_failure_streak = 0
         self._mo_total_counters = self._make_trace_bucket()
         self._mo_window_counters = self._make_trace_bucket()
 
@@ -329,6 +764,10 @@ class ELP(StandardELP):
             "eliteTriggerCount": int(getattr(self, "elite_trigger_count", 0) or 0),
             "eliteImprovementCount": int(getattr(self, "elite_improvement_count", 0) or 0),
             "archiveSize": len(getattr(self, "pareto_archive", []) or []),
+            "nonArchiveStagnationWindows": self._safe_float(self._nonarchive_stagnation_windows()),
+            "lastEffectiveArchiveChangeStep": int(getattr(self, "_last_effective_archive_change_step", 0) or 0),
+            "localSearchFailureStreak": int(getattr(self, "local_search_failure_streak", 0) or 0),
+            "localSearchEffectiveCooldown": int(self._effective_local_search_cooldown_steps()),
             "epsilon": self._safe_float(getattr(agent, "epsilon", None)),
             "latestLoss": self._safe_float(getattr(self, "_last_loss_value", None)),
             "agentTotalSteps": int(getattr(agent, "total_steps", 0) or 0) if hasattr(agent, "total_steps") else None,
@@ -757,6 +1196,15 @@ class ELP(StandardELP):
             solution,
             max_size=self.archive_limit,
             clone_fn=copy.deepcopy,
+            quality_gate_when_full=self.archive_quality_gate_when_full,
+            quality_hv_tol=self.archive_quality_hv_tol,
+            quality_spacing_tol=self.archive_quality_spacing_tol,
+            spacing_guard_when_full=bool(getattr(self, "archive_spacing_guard_when_full", False)),
+            spacing_guard_rel_tol=float(getattr(self, "archive_spacing_guard_rel_tol", 0.0) or 0.0),
+            spacing_guard_hv_gain_rel=float(getattr(self, "archive_spacing_guard_hv_gain_rel", 0.0) or 0.0),
+            require_candidate_retained=bool(getattr(self, "archive_require_candidate_retained", False)),
+            ideal=self.mo_ideal,
+            nadir=self.mo_nadir,
         )
         archive_changed = bool(inserted)
         if archive_changed:
@@ -805,6 +1253,14 @@ class ELP(StandardELP):
             "inserted": bool(inserted),
             "removedCount": int(removed or 0),
         }
+        if archive_changed or rep_changed:
+            observed_step = int(max(getattr(self, "_trace_global_step", 0) or 0, 0))
+            if int(getattr(self, "_trace_step_index", -1) or -1) >= 0:
+                observed_step += 1
+            self._last_effective_archive_change_step = max(
+                int(getattr(self, "_last_effective_archive_change_step", 0) or 0),
+                int(observed_step),
+            )
         if archive_changed or rep_changed:
             self._increment_archive_counters(archive_changed=archive_changed, rep_changed=rep_changed)
         if archive_changed:
@@ -968,6 +1424,101 @@ class ELP(StandardELP):
             state = state * 4 + band
         return state
 
+    def _nondominated_acceptance_cap(self):
+        progress_ratio = min(max(float(getattr(self, "current_progress_ratio", 0.0) or 0.0), 0.0), 1.0)
+        temperature_ratio = min(
+            max(float(getattr(self, "T", 0.0) or 0.0) / max(float(getattr(self, "T_initial", 1.0) or 1.0), 1e-8), 0.0),
+            1.0,
+        )
+        adaptive_factor = max(0.0, 0.75 * (1.0 - progress_ratio) + 0.25 * temperature_ratio)
+        cap_value = self.mo_nondominated_accept_cap_low + (
+            self.mo_nondominated_accept_cap_high - self.mo_nondominated_accept_cap_low
+        ) * adaptive_factor
+        # 前中期保持足够探索，避免过早收缩
+        if progress_ratio <= 0.30:
+            cap_value = max(cap_value, self.mo_nondominated_accept_cap_early_floor)
+        elif progress_ratio <= 0.70:
+            cap_value = max(cap_value, self.mo_nondominated_accept_cap_mid_floor)
+        else:
+            # 后 30% 逐步收紧上限，提高收敛稳定性
+            late_progress = min(max((progress_ratio - 0.70) / 0.30, 0.0), 1.0)
+            late_stage_cap = self.mo_nondominated_accept_cap_late_max_start + (
+                self.mo_nondominated_accept_cap_late_max_end - self.mo_nondominated_accept_cap_late_max_start
+            ) * late_progress
+            cap_value = min(cap_value, late_stage_cap)
+        return float(np.clip(cap_value, self.mo_nondominated_accept_cap_low, self.mo_nondominated_accept_cap_high))
+
+    def _should_trigger_local_search(self, global_step, archive_improved, relative_improvement):
+        if int(global_step) - int(getattr(self, "last_local_search_step", -10**9)) < int(
+            self._effective_local_search_cooldown_steps()
+        ):
+            return False
+        if bool(archive_improved):
+            return True
+        if float(getattr(self, "current_progress_ratio", 0.0) or 0.0) >= self.local_search_disable_after_progress:
+            return False
+        return float(relative_improvement) >= float(self.local_search_min_rel_improvement)
+
+    def _effective_local_search_cooldown_steps(self):
+        base_cooldown = int(max(1, int(getattr(self, "local_search_cooldown_steps", 1) or 1)))
+        if not bool(getattr(self, "local_search_backoff_enable", True)):
+            return base_cooldown
+        failure_streak = int(max(0, int(getattr(self, "local_search_failure_streak", 0) or 0)))
+        exp_cap = int(max(0, int(getattr(self, "local_search_backoff_exp_cap", 0) or 0)))
+        multiplier = 2 ** min(failure_streak, exp_cap)
+        cooldown = int(base_cooldown * max(1, multiplier))
+        max_steps = int(max(base_cooldown, int(getattr(self, "local_search_cooldown_max_steps", base_cooldown) or base_cooldown)))
+        return int(min(cooldown, max_steps))
+
+    def _update_local_search_backoff(self, improved):
+        # 局部搜索连续失败时指数退避，成功时立即重置
+        if bool(improved):
+            self.local_search_failure_streak = 0
+            return
+        self.local_search_failure_streak = int(getattr(self, "local_search_failure_streak", 0) or 0) + 1
+
+    def _nonarchive_stagnation_windows(self):
+        current_step = int(max(getattr(self, "_trace_global_step", 0) or 0, 0))
+        last_change_step = int(max(getattr(self, "_last_effective_archive_change_step", 0) or 0, 0))
+        stale_steps = max(current_step - last_change_step, 0)
+        return float(stale_steps) / float(max(1, int(getattr(self, "mo_trace_interval", 1000) or 1000)))
+
+    def _apply_late_nonarchive_gate(self, probability, archive_would_change):
+        """仅在后段停滞期对非入档候选进行概率门控，降低无效漂移。"""
+        probability = float(np.clip(probability, 0.0, 1.0))
+        if not bool(getattr(self, "mo_late_nonarchive_gate_enabled", False)):
+            return probability, False, 1.0, 1.0, 0.0, self._nonarchive_stagnation_windows()
+        if bool(archive_would_change):
+            return probability, False, 1.0, 1.0, 0.0, self._nonarchive_stagnation_windows()
+        gate_start = float(getattr(self, "mo_late_nonarchive_gate_start", 0.88) or 0.88)
+        progress_ratio = min(max(float(getattr(self, "current_progress_ratio", 0.0) or 0.0), 0.0), 1.0)
+        if progress_ratio < float(self.mo_late_nonarchive_stagnation_min_progress):
+            return probability, False, 1.0, 1.0, 0.0, self._nonarchive_stagnation_windows()
+
+        stagnation_windows = self._nonarchive_stagnation_windows()
+        trigger_windows = float(max(1, int(self.mo_late_nonarchive_stagnation_windows)))
+        if stagnation_windows < trigger_windows:
+            return probability, False, 1.0, 1.0, 0.0, stagnation_windows
+
+        progress_phase = 0.0
+        if gate_start < 1.0:
+            progress_phase = min(max((progress_ratio - gate_start) / max(1.0 - gate_start, 1e-8), 0.0), 1.0)
+        stagnation_phase = min(
+            max(
+                (stagnation_windows - trigger_windows + 1.0)
+                / float(max(1, int(self.mo_late_nonarchive_stagnation_ramp_windows))),
+                0.0,
+            ),
+            1.0,
+        )
+        late_phase = min(max(max(progress_phase, stagnation_phase), 0.0), 1.0)
+        scale = 1.0 - (1.0 - float(self.mo_late_nonarchive_prob_scale_end)) * float(late_phase)
+        cap = float(self.mo_late_nonarchive_prob_cap_start) + (
+            float(self.mo_late_nonarchive_prob_cap_end) - float(self.mo_late_nonarchive_prob_cap_start)
+        ) * float(late_phase)
+        gated_probability = float(min(probability * scale, cap))
+        return float(np.clip(gated_probability, 0.0, 1.0)), True, float(scale), float(cap), float(late_phase), float(stagnation_windows)
+
     def _accept_candidate_with_context(self, current_solution, candidate_solution):
         comparison = MO_FBSUtil.compare_solution_quality(candidate_solution, current_solution)
         current_tilde = self._tilde_energy(current_solution.fitness)
@@ -977,24 +1528,85 @@ class ELP(StandardELP):
             candidate_solution,
             max_size=self.archive_limit,
             clone_fn=lambda item: item,
+            quality_gate_when_full=self.archive_quality_gate_when_full,
+            quality_hv_tol=self.archive_quality_hv_tol,
+            quality_spacing_tol=self.archive_quality_spacing_tol,
+            spacing_guard_when_full=bool(getattr(self, "archive_spacing_guard_when_full", False)),
+            spacing_guard_rel_tol=float(getattr(self, "archive_spacing_guard_rel_tol", 0.0) or 0.0),
+            spacing_guard_hv_gain_rel=float(getattr(self, "archive_spacing_guard_hv_gain_rel", 0.0) or 0.0),
+            require_candidate_retained=bool(getattr(self, "archive_require_candidate_retained", False)),
+            ideal=self.mo_ideal,
+            nadir=self.mo_nadir,
         )
         _ = archive_preview
 
         if comparison < 0:
             accept = True
             probability = 1.0
+            raw_probability = 1.0
+            probability_cap = 1.0
+            late_gate_applied = False
+            late_gate_scale = 1.0
+            late_gate_cap = 1.0
+            late_gate_phase = 0.0
+            late_gate_stagnation_windows = self._nonarchive_stagnation_windows()
         elif comparison > 0:
             accept = False
             probability = 0.0
+            raw_probability = 0.0
+            probability_cap = 0.0
+            late_gate_applied = False
+            late_gate_scale = 1.0
+            late_gate_cap = 0.0
+            late_gate_phase = 0.0
+            late_gate_stagnation_windows = self._nonarchive_stagnation_windows()
         else:
-            exponent = (current_tilde - candidate_tilde) / max(self.T, 1e-12)
-            exponent = max(min(exponent, 700.0), -700.0)
-            probability = math.exp(exponent)
-            accept = bool(np.random.rand() < probability)
+            if candidate_tilde <= current_tilde + 1e-12:
+                raw_probability = 1.0
+                probability_cap = 1.0
+                probability = 1.0
+                (
+                    probability,
+                    late_gate_applied,
+                    late_gate_scale,
+                    late_gate_cap,
+                    late_gate_phase,
+                    late_gate_stagnation_windows,
+                ) = self._apply_late_nonarchive_gate(
+                    probability,
+                    archive_would_change=archive_would_change,
+                )
+                accept = bool(np.random.rand() < probability)
+            else:
+                exponent = (current_tilde - candidate_tilde) / max(self.T, 1e-12)
+                exponent = max(min(exponent, 700.0), -700.0)
+                raw_probability = float(min(1.0, math.exp(exponent)))
+                probability_cap = self._nondominated_acceptance_cap()
+                probability = float(min(raw_probability, probability_cap))
+                (
+                    probability,
+                    late_gate_applied,
+                    late_gate_scale,
+                    late_gate_cap,
+                    late_gate_phase,
+                    late_gate_stagnation_windows,
+                ) = self._apply_late_nonarchive_gate(
+                    probability,
+                    archive_would_change=archive_would_change,
+                )
+                accept = bool(np.random.rand() < probability)
 
         self._last_transition_meta = {
             "comparison": comparison,
             "archive_would_change": bool(archive_would_change),
+            "raw_probability": float(raw_probability),
+            "probability_cap": float(probability_cap),
+            "late_nonarchive_gate_applied": bool(late_gate_applied),
+            "late_nonarchive_gate_scale": float(late_gate_scale),
+            "late_nonarchive_gate_cap": float(late_gate_cap),
+            "late_nonarchive_gate_phase": float(late_gate_phase),
+            "late_nonarchive_stagnation_windows": float(late_gate_stagnation_windows),
+            "probability_after_gate": float(probability),
             "current_proxy": float(getattr(current_solution, "proxy_energy", current_solution.fitness)),
             "candidate_proxy": float(getattr(candidate_solution, "proxy_energy", candidate_solution.fitness)),
             "current_violation": float(getattr(current_solution, "constraint_violation", 0.0) or 0.0),
@@ -1178,7 +1790,15 @@ class ELP(StandardELP):
             "solution": solution_array,
         }
 
-    def _save_pareto_archive(self, start_time):
+    @staticmethod
+    def _normalize_algorithm_tag(name):
+        raw = str(name or "ELP_DRL_MO")
+        cleaned = "".join(ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_" for ch in raw)
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        return cleaned.strip("_") or "ELP_DRL_MO"
+
+    def _save_pareto_archive(self, start_time, algorithm_name=None):
         if not self.pareto_archive:
             self.pareto_archive_path = None
             return None
@@ -1187,12 +1807,17 @@ class ELP(StandardELP):
         archive_dir = Path(config.RESULT_PATH) / "pareto_archives"
         archive_dir.mkdir(parents=True, exist_ok=True)
         timestamp = start_time.strftime("%Y%m%d_%H%M%S_%f") if start_time is not None else datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        filename = f"{self.instance_name}-ELP_DRL_MO-{timestamp}.json"
+        algo_tag = self._normalize_algorithm_tag(algorithm_name)
+        filename = f"{self.instance_name}-{algo_tag}-{timestamp}.json"
         archive_path = archive_dir / filename
 
         payload = {
             "instance": self.instance_name,
-            "algorithm": "ELP_DRL_MO",
+            "algorithm": algo_tag,
+            "objectiveDefinitionVersion": MO_ReferenceFrontUtil.OBJECTIVE_DEFINITION_VERSION,
+            "arSatisfactionMode": "paper_triangular",
+            "arLowerAspectRatio": 1.0,
+            "arOptimalAspectRatio": 1.5,
             "generatedAt": datetime.datetime.now().isoformat(timespec="seconds"),
             "archiveSize": len(self.pareto_archive),
             "representativeArchiveIndex": None if self.representative_archive_index is None else int(self.representative_archive_index) + 1,
@@ -1202,6 +1827,479 @@ class ELP(StandardELP):
         archive_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.pareto_archive_path = archive_path.resolve().relative_to(repo_root).as_posix()
         return self.pareto_archive_path
+
+    def _ensure_pymoo_available(self):
+        if NSGA2 is not None and MOEAD is not None and SPEA2 is not None:
+            return
+        raise ImportError(
+            "缺少 pymoo 依赖，无法运行 NSGA-II/MOEA-D/SPEA2 基线。请先安装 `pymoo>=0.6.1`。"
+        ) from _PYMOO_IMPORT_ERROR
+
+    def _evaluate_action_sequence(self, base_solution, action_sequence):
+        candidate = self._light_clone_solution(base_solution)
+        action_count = int(max(1, len(self.valid_actions)))
+        for action_token in np.asarray(action_sequence, dtype=int).reshape(-1):
+            table_idx = int(np.clip(action_token, 0, action_count - 1))
+            action_idx = self.valid_actions[table_idx]
+            candidate = self.generate_candidate_by_action(candidate, action_idx)
+        return candidate
+
+    def _reset_baseline_archive_state(self):
+        self.pareto_archive = []
+        self.representative_solution = None
+        self.representative_decision_score = math.inf
+        self.representative_archive_index = None
+        self.mo_ideal = None
+        self.mo_nadir = None
+        self.pareto_archive_path = None
+        self.best_feasible_cost = math.inf
+        self.worst_feasible_cost = None
+        self.best_feasible_solution = None
+        self.feasible_solution_count = 0
+        self.mo_worst_feasible_mhc = None
+        self.gbest_update_count = 0
+
+    @staticmethod
+    def _compute_moead_partitions(population_size, objective_count=4):
+        objective_count = int(max(2, objective_count))
+        population_size = int(max(2, population_size))
+        partitions = 1
+        while math.comb(partitions + objective_count - 1, objective_count - 1) < population_size:
+            partitions += 1
+        return partitions
+
+    def _collect_result_sequences(self, result):
+        sequences = []
+        population = getattr(result, "pop", None)
+        if population is not None:
+            pop_x = population.get("X")
+            if pop_x is not None:
+                pop_x = np.asarray(pop_x, dtype=int)
+                if pop_x.ndim == 1:
+                    pop_x = pop_x.reshape(1, -1)
+                sequences.extend(pop_x.tolist())
+        if not sequences and getattr(result, "X", None) is not None:
+            result_x = np.asarray(result.X, dtype=int)
+            if result_x.ndim == 1:
+                result_x = result_x.reshape(1, -1)
+            sequences.extend(result_x.tolist())
+        return sequences
+
+    @staticmethod
+    def _baseline_float_env(name, default):
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            return float(str(raw).strip())
+        except Exception:
+            return float(default)
+
+    def _baseline_solution_score(self, solution):
+        if solution is None:
+            return math.inf
+        objectives = getattr(solution, "mo_objectives_min", None)
+        if objectives is not None:
+            try:
+                score = MO_FBSUtil.surrogate_energy(
+                    objectives,
+                    ideal=self.mo_ideal,
+                    nadir=self.mo_nadir,
+                    weights=self.mo_weights,
+                )
+                if np.isfinite(score):
+                    return float(score)
+            except Exception:
+                pass
+        for attr in ("decision_score", "proxy_energy", "fitness"):
+            value = getattr(solution, attr, math.inf)
+            try:
+                value = float(value)
+            except Exception:
+                continue
+            if np.isfinite(value):
+                return float(value)
+        return math.inf
+
+    def _baseline_solution_rank_key(self, solution):
+        if solution is None:
+            return (1, math.inf, math.inf, math.inf)
+        is_feasible, d_inf, violation = MO_FBSUtil.constraint_signature(solution)
+        return (
+            0 if is_feasible else 1,
+            int(max(d_inf, 0)),
+            float(max(violation, 0.0)),
+            self._baseline_solution_score(solution),
+        )
+
+    def _baseline_solution_preferred(self, candidate, incumbent):
+        if candidate is None:
+            return False
+        if incumbent is None:
+            return True
+        quality_cmp = MO_FBSUtil.compare_solution_quality(candidate, incumbent)
+        if quality_cmp < 0:
+            return True
+        if quality_cmp > 0:
+            return False
+        return self._baseline_solution_score(candidate) < self._baseline_solution_score(incumbent) - 1e-12
+
+    def _truncate_pso_guide_archive(self, entries, limit):
+        limit = int(max(1, limit))
+        entries = list(entries or [])
+        while len(entries) > limit:
+            candidates = [entry["candidate"] for entry in entries]
+            normalized, _, _ = MO_FBSUtil._normalized_archive_matrix(
+                candidates,
+                ideal=self.mo_ideal,
+                nadir=self.mo_nadir,
+            )
+            if normalized.shape[0] != len(entries) or normalized.shape[0] <= 1:
+                remove_idx = max(range(len(entries)), key=lambda idx: self._baseline_solution_score(entries[idx]["candidate"]))
+                entries.pop(remove_idx)
+                continue
+            distances = np.linalg.norm(normalized[:, None, :] - normalized[None, :, :], axis=2)
+            np.fill_diagonal(distances, np.inf)
+            nearest = np.min(distances, axis=1)
+            remove_idx = min(
+                range(len(entries)),
+                key=lambda idx: (
+                    float(nearest[idx]) if np.isfinite(nearest[idx]) else math.inf,
+                    -self._baseline_solution_score(entries[idx]["candidate"]),
+                ),
+            )
+            entries.pop(remove_idx)
+        return entries
+
+    def _update_pso_guide_archive(self, entries, position, candidate, limit):
+        if not getattr(candidate, "current_is_feasible", False):
+            return list(entries or [])
+        objectives = getattr(candidate, "mo_objectives_min", None)
+        if objectives is None:
+            return list(entries or [])
+
+        new_entry = {
+            "position": np.asarray(position, dtype=float).copy(),
+            "candidate": candidate,
+        }
+        updated = []
+        dominated_or_duplicate = False
+        replaced_duplicate = False
+        for entry in list(entries or []):
+            other = entry["candidate"]
+            other_objectives = getattr(other, "mo_objectives_min", None)
+            if other_objectives is None:
+                continue
+            if MO_FBSUtil._duplicate_objectives(candidate, other):
+                dominated_or_duplicate = True
+                if not replaced_duplicate and self._baseline_solution_preferred(candidate, other):
+                    updated.append(new_entry)
+                    replaced_duplicate = True
+                else:
+                    updated.append(entry)
+                continue
+            if MO_FBSUtil.pareto_dominates(other_objectives, objectives):
+                dominated_or_duplicate = True
+                updated.append(entry)
+                continue
+            if MO_FBSUtil.pareto_dominates(objectives, other_objectives):
+                continue
+            updated.append(entry)
+
+        if not dominated_or_duplicate:
+            updated.append(new_entry)
+        return self._truncate_pso_guide_archive(updated, limit)
+
+    def _sample_pso_guide_position(self, guide_entries, pbest_positions, pbest_candidates, rng):
+        if guide_entries:
+            guide_idx = int(rng.integers(0, len(guide_entries)))
+            return np.asarray(guide_entries[guide_idx]["position"], dtype=float).copy()
+        valid_indices = [idx for idx, candidate in enumerate(pbest_candidates) if candidate is not None]
+        if valid_indices:
+            best_idx = min(valid_indices, key=lambda idx: self._baseline_solution_rank_key(pbest_candidates[idx]))
+            return np.asarray(pbest_positions[best_idx], dtype=float).copy()
+        upper = max(0, len(self.valid_actions) - 1)
+        return rng.uniform(0.0, float(upper), size=int(pbest_positions.shape[1]))
+
+    def _run_pso_baseline(
+        self,
+        population_size=64,
+        generations=80,
+        sequence_length=None,
+        seed=None,
+    ):
+        population_size = int(max(8, population_size))
+        generations = int(max(1, generations))
+        sequence_length = int(max(1, sequence_length if sequence_length is not None else self.t_max))
+        run_seed = None if seed is None else int(seed)
+        rng = np.random.default_rng(run_seed)
+
+        action_count = int(max(1, len(self.valid_actions)))
+        action_upper = float(max(0, action_count - 1))
+        inertia = float(np.clip(self._baseline_float_env("ELP_MO_PSO_INERTIA", 0.72), 0.0, 1.5))
+        cognitive = float(max(0.0, self._baseline_float_env("ELP_MO_PSO_C1", 1.49)))
+        social = float(max(0.0, self._baseline_float_env("ELP_MO_PSO_C2", 1.49)))
+        vmax_ratio = float(np.clip(self._baseline_float_env("ELP_MO_PSO_VMAX_RATIO", 0.50), 0.0, 2.0))
+        vmax = max(1.0, action_upper * vmax_ratio) if action_count > 1 else 0.0
+        default_mutation_prob = 1.0 / float(max(1, sequence_length))
+        mutation_prob = float(np.clip(self._baseline_float_env("ELP_MO_PSO_MUTATION_PROB", default_mutation_prob), 0.0, 1.0))
+        guide_limit = int(max(self.archive_limit, population_size))
+
+        self._reset_baseline_archive_state()
+        start_time = datetime.datetime.now()
+        fast_time = start_time
+
+        base_solution = self._light_clone_solution(self.s)
+        self._evaluate_solution(base_solution)
+        self._observe_feasible_state(base_solution)
+
+        positions = rng.integers(0, action_count, size=(population_size, sequence_length)).astype(float)
+        velocities = (
+            rng.uniform(-vmax, vmax, size=(population_size, sequence_length))
+            if vmax > 0.0
+            else np.zeros((population_size, sequence_length), dtype=float)
+        )
+        pbest_positions = positions.copy()
+        pbest_candidates = [None for _ in range(population_size)]
+        guide_entries = []
+        best_observed = self.best_feasible_cost
+        evaluations = 0
+
+        for generation in range(generations):
+            for particle_idx in range(population_size):
+                sequence = np.rint(positions[particle_idx]).astype(int)
+                sequence = np.clip(sequence, 0, action_count - 1)
+                candidate = self._evaluate_action_sequence(base_solution, sequence)
+                evaluations += 1
+                changed = self._observe_feasible_state(candidate)
+                if changed and np.isfinite(self.best_feasible_cost) and self.best_feasible_cost < best_observed:
+                    best_observed = float(self.best_feasible_cost)
+                    fast_time = datetime.datetime.now()
+                if self._baseline_solution_preferred(candidate, pbest_candidates[particle_idx]):
+                    pbest_candidates[particle_idx] = candidate
+                    pbest_positions[particle_idx] = positions[particle_idx].copy()
+                guide_entries = self._update_pso_guide_archive(
+                    guide_entries,
+                    positions[particle_idx],
+                    candidate,
+                    guide_limit,
+                )
+
+            if generation >= generations - 1:
+                break
+            for particle_idx in range(population_size):
+                guide_position = self._sample_pso_guide_position(guide_entries, pbest_positions, pbest_candidates, rng)
+                r1 = rng.random(sequence_length)
+                r2 = rng.random(sequence_length)
+                velocities[particle_idx] = (
+                    inertia * velocities[particle_idx]
+                    + cognitive * r1 * (pbest_positions[particle_idx] - positions[particle_idx])
+                    + social * r2 * (guide_position - positions[particle_idx])
+                )
+                if vmax > 0.0:
+                    velocities[particle_idx] = np.clip(velocities[particle_idx], -vmax, vmax)
+                positions[particle_idx] = np.clip(positions[particle_idx] + velocities[particle_idx], 0.0, action_upper)
+                if mutation_prob > 0.0 and action_count > 1:
+                    mutate_mask = rng.random(sequence_length) < mutation_prob
+                    if np.any(mutate_mask):
+                        positions[particle_idx, mutate_mask] = rng.integers(0, action_count, size=int(np.sum(mutate_mask)))
+                        velocities[particle_idx, mutate_mask] = 0.0
+
+        self._refresh_archive_state()
+        end_time = datetime.datetime.now()
+        iteration_count = int(evaluations)
+
+        best_solution = self.best_feasible_solution if self.best_feasible_solution is not None else self._light_clone_solution(base_solution)
+        if self.representative_solution is not None:
+            best_solution = copy.deepcopy(self.representative_solution)
+        is_valid = bool(getattr(best_solution, "current_is_feasible", False))
+        best_energy = float(getattr(best_solution, "decision_score", math.inf))
+        if not np.isfinite(best_energy):
+            best_energy = float(self.best_feasible_cost if np.isfinite(self.best_feasible_cost) else best_solution.fitness)
+
+        stable_decision_score = self._safe_float(getattr(best_solution, "proxy_energy", None))
+        archive_path = self._save_pareto_archive(start_time, algorithm_name="MO_BASELINE_PSO")
+        reference_metrics = self._compute_reference_front_metrics()
+        archive_hypervolume = reference_metrics["archive_hypervolume"]
+        archive_spacing = reference_metrics["archive_spacing"]
+        self.last_run_payload = {
+            "pareto_archive_path": archive_path,
+            "pareto_size": len(self.pareto_archive),
+            "rep_mhc": None if best_solution is None else float(getattr(best_solution, "MHC", math.inf)),
+            "rep_cr": None if best_solution is None else float(getattr(best_solution, "CR", 0.0)),
+            "rep_dr": None if best_solution is None else float(getattr(best_solution, "DR", 0.0)),
+            "rep_ar": None if best_solution is None else float(getattr(best_solution, "AR", 0.0)),
+            "decision_score": self._safe_float(best_energy),
+            "stable_decision_score": stable_decision_score,
+            "archive_hypervolume": archive_hypervolume,
+            "archive_spacing": archive_spacing,
+            "archive_igd": reference_metrics["archive_igd"],
+            "reference_front_path": reference_metrics["reference_front_path"],
+            "reference_front_size": reference_metrics["reference_front_size"],
+            "reference_front_archive_count": reference_metrics["reference_front_archive_count"],
+            "archive_hypervolume_mode": reference_metrics["archive_hypervolume_mode"],
+            "archive_hypervolume_reference_point": reference_metrics["archive_hypervolume_reference_point"],
+            "mo_run_id": None,
+            "mo_bundle_dir": None,
+            "mo_trace_path": None,
+            "mo_events_path": None,
+            "mo_action_stats_path": None,
+            "mo_run_summary_path": None,
+            "baseline_algorithm": "PSO",
+            "baseline_population": int(population_size),
+            "baseline_generations": int(generations),
+            "baseline_sequence_length": int(sequence_length),
+            "baseline_seed": run_seed,
+            "baseline_pso_inertia": float(inertia),
+            "baseline_pso_c1": float(cognitive),
+            "baseline_pso_c2": float(social),
+            "baseline_pso_vmax_ratio": float(vmax_ratio),
+            "baseline_pso_mutation_prob": float(mutation_prob),
+            "baseline_pso_guide_limit": int(guide_limit),
+        }
+        return iteration_count, is_valid, best_solution, best_energy, start_time, end_time, fast_time
+
+    def run_moea_baseline(
+        self,
+        algorithm_name,
+        population_size=64,
+        generations=80,
+        sequence_length=None,
+        seed=None,
+    ):
+        algo_key = str(algorithm_name or "").strip().lower().replace("-", "").replace("/", "")
+        if algo_key in {"pso", "mopso"}:
+            return self._run_pso_baseline(
+                population_size=population_size,
+                generations=generations,
+                sequence_length=sequence_length,
+                seed=seed,
+            )
+
+        self._ensure_pymoo_available()
+        if algo_key not in {"nsga2", "moead", "spea2"}:
+            raise ValueError(f"Unsupported baseline algorithm: {algorithm_name}")
+
+        population_size = int(max(8, population_size))
+        generations = int(max(1, generations))
+        sequence_length = int(max(1, sequence_length if sequence_length is not None else self.t_max))
+        run_seed = None if seed is None else int(seed)
+
+        self._reset_baseline_archive_state()
+        start_time = datetime.datetime.now()
+        fast_time = start_time
+
+        base_solution = self._light_clone_solution(self.s)
+        self._evaluate_solution(base_solution)
+        self._observe_feasible_state(base_solution)
+
+        problem = _ActionSequenceMOProblem(
+            solver=self,
+            base_solution=base_solution,
+            sequence_length=sequence_length,
+            use_constraints=(algo_key != "moead"),
+        )
+        sampling = _ActionSequenceSampling()
+        crossover = _ActionSequenceUniformCrossover(swap_prob=0.5)
+        mutation = _ActionSequenceMutation(mutation_prob=1.0 / float(max(1, sequence_length)))
+
+        if algo_key == "nsga2":
+            algorithm = NSGA2(
+                pop_size=population_size,
+                sampling=sampling,
+                crossover=crossover,
+                mutation=mutation,
+                eliminate_duplicates=True,
+            )
+            effective_population = population_size
+        elif algo_key == "spea2":
+            algorithm = SPEA2(
+                pop_size=population_size,
+                sampling=sampling,
+                crossover=crossover,
+                mutation=mutation,
+                survival=SPEA2Survival(normalize=False),
+                eliminate_duplicates=True,
+            )
+            effective_population = population_size
+        else:
+            n_partitions = self._compute_moead_partitions(population_size, objective_count=4)
+            ref_dirs = get_reference_directions("das-dennis", 4, n_partitions=n_partitions)
+            algorithm = MOEAD(
+                ref_dirs=ref_dirs,
+                n_neighbors=min(20, max(2, len(ref_dirs) - 1)),
+                prob_neighbor_mating=0.7,
+                sampling=sampling,
+                crossover=crossover,
+                mutation=mutation,
+            )
+            effective_population = int(len(ref_dirs))
+
+        result = minimize(
+            problem,
+            algorithm,
+            termination=get_termination("n_gen", generations),
+            seed=run_seed,
+            save_history=False,
+            verbose=False,
+        )
+
+        best_observed = self.best_feasible_cost
+        for sequence in self._collect_result_sequences(result):
+            candidate = self._evaluate_action_sequence(base_solution, sequence)
+            changed = self._observe_feasible_state(candidate)
+            if changed and np.isfinite(self.best_feasible_cost) and self.best_feasible_cost < best_observed:
+                best_observed = float(self.best_feasible_cost)
+                fast_time = datetime.datetime.now()
+
+        self._refresh_archive_state()
+        end_time = datetime.datetime.now()
+        iteration_count = int(effective_population * generations)
+
+        best_solution = self.best_feasible_solution if self.best_feasible_solution is not None else self._light_clone_solution(base_solution)
+        if self.representative_solution is not None:
+            best_solution = copy.deepcopy(self.representative_solution)
+        is_valid = bool(getattr(best_solution, "current_is_feasible", False))
+        best_energy = float(getattr(best_solution, "decision_score", math.inf))
+        if not np.isfinite(best_energy):
+            best_energy = float(self.best_feasible_cost if np.isfinite(self.best_feasible_cost) else best_solution.fitness)
+
+        stable_decision_score = self._safe_float(getattr(best_solution, "proxy_energy", None))
+        archive_algo_name = f"MO_BASELINE_{algo_key.upper()}"
+        archive_path = self._save_pareto_archive(start_time, algorithm_name=archive_algo_name)
+        reference_metrics = self._compute_reference_front_metrics()
+        archive_hypervolume = reference_metrics["archive_hypervolume"]
+        archive_spacing = reference_metrics["archive_spacing"]
+        self.last_run_payload = {
+            "pareto_archive_path": archive_path,
+            "pareto_size": len(self.pareto_archive),
+            "rep_mhc": None if best_solution is None else float(getattr(best_solution, "MHC", math.inf)),
+            "rep_cr": None if best_solution is None else float(getattr(best_solution, "CR", 0.0)),
+            "rep_dr": None if best_solution is None else float(getattr(best_solution, "DR", 0.0)),
+            "rep_ar": None if best_solution is None else float(getattr(best_solution, "AR", 0.0)),
+            "decision_score": self._safe_float(best_energy),
+            "stable_decision_score": stable_decision_score,
+            "archive_hypervolume": archive_hypervolume,
+            "archive_spacing": archive_spacing,
+            "archive_igd": reference_metrics["archive_igd"],
+            "reference_front_path": reference_metrics["reference_front_path"],
+            "reference_front_size": reference_metrics["reference_front_size"],
+            "reference_front_archive_count": reference_metrics["reference_front_archive_count"],
+            "archive_hypervolume_mode": reference_metrics["archive_hypervolume_mode"],
+            "archive_hypervolume_reference_point": reference_metrics["archive_hypervolume_reference_point"],
+            "mo_run_id": None,
+            "mo_bundle_dir": None,
+            "mo_trace_path": None,
+            "mo_events_path": None,
+            "mo_action_stats_path": None,
+            "mo_run_summary_path": None,
+            "baseline_algorithm": algo_key.upper(),
+            "baseline_population": int(effective_population),
+            "baseline_generations": int(generations),
+            "baseline_sequence_length": int(sequence_length),
+            "baseline_seed": run_seed,
+        }
+        return iteration_count, is_valid, best_solution, best_energy, start_time, end_time, fast_time
 
     def _run_impl(self):
         start_time = datetime.datetime.now()
@@ -1252,13 +2350,34 @@ class ELP(StandardELP):
         global_step = 0
         total_steps = max(1, self.G * self.t_max)
         next_progress_marker_idx = 0
+        wall_time_terminated = False
         for episode in range(self.G):
+            if self._wall_time_limit_reached(start_time):
+                wall_time_terminated = True
+                self._record_mo_event(
+                    "wall_time_stop",
+                    totalIterations=int(global_step),
+                    wallTimeLimitSeconds=self._safe_float(getattr(self, "wall_time_limit_seconds", None)),
+                    elapsedSeconds=self._safe_float(self._elapsed_seconds_since(start_time)),
+                    progressRatio=self._safe_float(float(global_step) / float(max(1, total_steps))),
+                )
+                break
             if self.worst_feasible_cost is None and not self._bootstrap_until_first_feasible(max_attempts=max(200, 2 * self.t_max)):
                 logger.warning(f"Episode {episode}: feasible archive still unavailable.")
                 continue
             episode_best_before = self.best_feasible_cost
             self._prepare_episode_start(episode)
             for step_idx in range(self.t_max):
+                if self._wall_time_limit_reached(start_time):
+                    wall_time_terminated = True
+                    self._record_mo_event(
+                        "wall_time_stop",
+                        totalIterations=int(global_step),
+                        wallTimeLimitSeconds=self._safe_float(getattr(self, "wall_time_limit_seconds", None)),
+                        elapsedSeconds=self._safe_float(self._elapsed_seconds_since(start_time)),
+                        progressRatio=self._safe_float(float(global_step) / float(max(1, total_steps))),
+                    )
+                    break
                 self._trace_global_step = global_step
                 self._trace_episode_index = episode
                 self._trace_step_index = step_idx
@@ -1289,6 +2408,8 @@ class ELP(StandardELP):
                     self.s = candidate
                     self.current_energy = self.s.fitness
                     archive_improved = self._observe_feasible_state(self.s)
+                    if self._last_transition_meta:
+                        self._last_transition_meta["archive_would_change"] = bool(archive_improved)
                     if archive_improved:
                         self._record_action_global_best(real_action_idx, phase="main")
                     accepted_improved = bool(
@@ -1307,7 +2428,11 @@ class ELP(StandardELP):
                     relative_improvement = 0.0
                     if np.isfinite(previous_cost) and abs(previous_cost) > 1e-12 and np.isfinite(self.s.fitness):
                         relative_improvement = max((previous_cost - self.s.fitness) / abs(previous_cost), 0.0)
-                    trigger_local_search = improved or (relative_improvement >= 0.005)
+                    trigger_local_search = self._should_trigger_local_search(
+                        global_step=global_step,
+                        archive_improved=improved,
+                        relative_improvement=relative_improvement,
+                    )
                     self._update_histogram(self.s.fitness)
                     if improved:
                         self.no_improve_steps = 0
@@ -1316,6 +2441,7 @@ class ELP(StandardELP):
                         self.no_improve_steps += 1
 
                     if trigger_local_search:
+                        self.last_local_search_step = int(global_step)
                         local_search_best_before = self.best_feasible_cost
                         local_search_cost_before = self.s.fitness
                         previous_context = dict(getattr(self, "_current_action_context", {}) or {})
@@ -1327,11 +2453,14 @@ class ELP(StandardELP):
                             and self.best_feasible_cost < local_search_best_before
                         )
                         self._note_local_search(improved=local_search_improved)
+                        self._update_local_search_backoff(local_search_improved)
                         self._record_mo_event(
                             "local_search",
                             improved=local_search_improved,
                             beforeSearchEnergy=self._safe_float(local_search_cost_before),
                             afterSearchEnergy=self._safe_float(self.s.fitness),
+                            failureStreak=int(getattr(self, "local_search_failure_streak", 0) or 0),
+                            effectiveCooldown=int(self._effective_local_search_cooldown_steps()),
                         )
                         self._current_action_context = previous_context
                         if self.s.current_is_feasible and self.s.fitness < previous_best_feasible:
@@ -1400,6 +2529,9 @@ class ELP(StandardELP):
             if callable(finalize_episode):
                 finalize_episode()
 
+            if wall_time_terminated:
+                break
+
             self.T = max(self.T * self.cooling_per_step, self.T_min)
 
             if np.isfinite(self.best_feasible_cost) and self.best_feasible_cost < episode_best_before:
@@ -1408,7 +2540,7 @@ class ELP(StandardELP):
                 self.episodes_without_improvement += 1
             agent.decay_epsilon()
 
-        while next_progress_marker_idx < len(self.progress_markers):
+        while (not wall_time_terminated) and next_progress_marker_idx < len(self.progress_markers):
             self._log_training_progress(self.progress_markers[next_progress_marker_idx], start_time)
             next_progress_marker_idx += 1
 
@@ -1423,8 +2555,22 @@ class ELP(StandardELP):
             best_solution = copy.deepcopy(self.representative_solution)
             best_energy = float(self.representative_decision_score)
             is_valid = bool(getattr(best_solution, "current_is_feasible", False))
-
-        archive_path = self._save_pareto_archive(start_time)
+        representative_stable_score = None
+        if best_solution is not None:
+            representative_stable_score = self._safe_float(getattr(best_solution, "proxy_energy", None))
+            if representative_stable_score is None and getattr(best_solution, "mo_objectives_min", None) is not None:
+                representative_stable_score = self._safe_float(
+                    MO_FBSUtil.surrogate_energy(
+                        best_solution.mo_objectives_min,
+                        ideal=self.mo_ideal,
+                        nadir=self.mo_nadir,
+                        weights=self.mo_weights,
+                    )
+                )
+        archive_path = self._save_pareto_archive(start_time, algorithm_name=run_algorithm)
+        reference_metrics = self._compute_reference_front_metrics()
+        archive_hypervolume = reference_metrics["archive_hypervolume"]
+        archive_spacing = reference_metrics["archive_spacing"]
         solution_array = getattr(getattr(best_solution, "fbs_model", None), "array_2d", None)
         if hasattr(solution_array, "tolist"):
             solution_array = solution_array.tolist()
@@ -1435,6 +2581,8 @@ class ELP(StandardELP):
             runtimeSeconds=self._safe_float((end_time - start_time).total_seconds()),
             bestResultSeconds=self._safe_float(best_result_seconds),
             archivePath=archive_path,
+            wallTimeTerminated=bool(wall_time_terminated),
+            wallTimeLimitSeconds=self._safe_float(getattr(self, "wall_time_limit_seconds", None)),
         )
         action_stats = self._build_action_stats_payload(agent, global_step)
         run_summary = {
@@ -1444,17 +2592,30 @@ class ELP(StandardELP):
             "runtimeSeconds": (end_time - start_time).total_seconds(),
             "bestResultSeconds": best_result_seconds,
             "iterations": int(global_step),
+            "wallTimeTerminated": bool(wall_time_terminated),
+            "wallTimeLimitSeconds": self._safe_float(getattr(self, "wall_time_limit_seconds", None)),
             "isValid": bool(is_valid),
             "gbestUpdateCount": int(self.gbest_update_count),
             "feasibleSolutionCount": int(self.feasible_solution_count),
             "archiveSize": int(len(self.pareto_archive)),
             "representativeArchiveIndex": None if self.representative_archive_index is None else int(self.representative_archive_index) + 1,
             "decisionScore": self._safe_float(best_energy),
+            "stableDecisionScore": representative_stable_score,
+            "archiveHypervolume": archive_hypervolume,
+            "archiveSpacing": archive_spacing,
+            "archiveIgd": reference_metrics["archive_igd"],
+            "referenceFrontPath": reference_metrics["reference_front_path"],
+            "referenceFrontSize": reference_metrics["reference_front_size"],
+            "referenceArchiveCount": reference_metrics["reference_front_archive_count"],
+            "archiveHypervolumeMode": reference_metrics["archive_hypervolume_mode"],
+            "archiveHypervolumeReferencePoint": reference_metrics["archive_hypervolume_reference_point"],
             "repMhc": None if best_solution is None else self._safe_float(getattr(best_solution, "MHC", None)),
             "repCr": None if best_solution is None else self._safe_float(getattr(best_solution, "CR", None)),
             "repDr": None if best_solution is None else self._safe_float(getattr(best_solution, "DR", None)),
             "repAr": None if best_solution is None else self._safe_float(getattr(best_solution, "AR", None)),
             "paretoArchivePath": archive_path,
+            "objectiveDefinitionVersion": MO_ReferenceFrontUtil.OBJECTIVE_DEFINITION_VERSION,
+            "arSatisfactionMode": "paper_triangular",
             "agentMode": agent_mode,
             "epsilonEnd": self._safe_float(getattr(agent, "epsilon", None)),
             "agentOptimizeSteps": int(getattr(agent, "optimize_steps", 0) or 0) if hasattr(agent, "optimize_steps") else None,
@@ -1475,6 +2636,17 @@ class ELP(StandardELP):
             "rep_dr": None if best_solution is None else float(getattr(best_solution, "DR", 0.0)),
             "rep_ar": None if best_solution is None else float(getattr(best_solution, "AR", 0.0)),
             "decision_score": None if not np.isfinite(best_energy) else float(best_energy),
+            "stable_decision_score": representative_stable_score,
+            "archive_hypervolume": archive_hypervolume,
+            "archive_spacing": archive_spacing,
+            "archive_igd": reference_metrics["archive_igd"],
+            "reference_front_path": reference_metrics["reference_front_path"],
+            "reference_front_size": reference_metrics["reference_front_size"],
+            "reference_front_archive_count": reference_metrics["reference_front_archive_count"],
+            "archive_hypervolume_mode": reference_metrics["archive_hypervolume_mode"],
+            "archive_hypervolume_reference_point": reference_metrics["archive_hypervolume_reference_point"],
+            "wall_time_terminated": bool(wall_time_terminated),
+            "wall_time_limit_seconds": self._safe_float(getattr(self, "wall_time_limit_seconds", None)),
             "mo_run_id": self.mo_run_summary.get("runId"),
             "mo_bundle_dir": self.mo_run_summary.get("bundleDir"),
             "mo_trace_path": self.mo_run_summary.get("tracePath"),
@@ -1504,38 +2676,110 @@ def _save_experiment_row(exp_instance, exp_algorithm, exp_remark, total_iter, is
 
 
 if __name__ == "__main__":
-    exp_instance = "Du62"
-    exp_algorithm = "ELP_DRL_MO"
-    exp_remark = "WarmStart(GA)+ELP+Pareto archive with representative solution"
-    exp_number = 30
-    is_exp = True
+    def _format_summary_metrics(solver, best_energy):
+        payload = getattr(solver, "last_run_payload", {}) or {}
+        hv = payload.get("archive_hypervolume")
+        igd = payload.get("archive_igd")
+        spacing = payload.get("archive_spacing")
 
-    G = 1000
-    t_max = 300
-    T_initial = 10000.0
-    k_hist = 10.0
+        def _fmt(value):
+            return "NA" if value is None else f"{float(value):.6f}"
+
+        return (
+            f"representative decision score: {float(best_energy):.6f} | "
+            f"HV: {_fmt(hv)} | IGD: {_fmt(igd)} | Spacing: {_fmt(spacing)}"
+        )
+
+    def _parse_env_int(name, default):
+        raw = os.getenv(name)
+        if raw is None:
+            return int(default)
+        try:
+            return int(raw.strip())
+        except Exception:
+            return int(default)
+
+    def _parse_env_float(name, default):
+        raw = os.getenv(name)
+        if raw is None:
+            return float(default)
+        try:
+            return float(raw.strip())
+        except Exception:
+            return float(default)
+
+    def _parse_env_flag(name, default):
+        raw = os.getenv(name)
+        if raw is None:
+            return bool(default)
+        return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    exp_instance = os.getenv("ELP_EXP_INSTANCE", "Du62")
+    baseline_algo = os.getenv("ELP_MO_BASELINE_ALGO", "").strip().lower()
+    baseline_enabled = baseline_algo in {"nsga2", "moead", "spea2", "pso", "mopso"}
+    default_algorithm = f"MO_BASELINE_{baseline_algo.upper()}" if baseline_enabled else "ELP_DRL_MO"
+    exp_algorithm = os.getenv("ELP_EXP_ALGORITHM", default_algorithm)
+    default_remark = (
+        "MO baseline on action-sequence encoding"
+        if baseline_enabled
+        else "WarmStart(GA)+ELP+Pareto archive with representative solution"
+    )
+    exp_remark = os.getenv("ELP_EXP_REMARK", default_remark)
+    exp_number = _parse_env_int("ELP_EXP_NUMBER", 30)
+    is_exp = _parse_env_flag("ELP_IS_EXP", True)
+
+    G = _parse_env_int("ELP_G", 1000)
+    t_max = _parse_env_int("ELP_T_MAX", 300)
+    T_initial = _parse_env_float("ELP_T_INITIAL", 10000.0)
+    k_hist = _parse_env_float("ELP_K_HIST", 10.0)
+    base_seed = _parse_env_int("ELP_BASE_SEED", 20260427)
+
+    baseline_population = _parse_env_int("ELP_MO_BASELINE_POP", 64)
+    baseline_generations = _parse_env_int("ELP_MO_BASELINE_GEN", 80)
+    baseline_sequence_length = _parse_env_int("ELP_MO_BASELINE_SEQ_LEN", t_max)
+
+    def _run_once(run_index):
+        run_seed = int(base_seed + run_index)
+        strict_determinism = _set_global_seed(run_seed)
+        logger.info(f"Experiment seed: {run_seed} | strict_determinism: {strict_determinism}")
+        env = gym.make("FbsEnv-v0", instance=exp_instance)
+        try:
+            env.reset(seed=run_seed)
+        except TypeError:
+            env.reset()
+        except Exception:
+            env.reset()
+        base_env = env.unwrapped if hasattr(env, "unwrapped") else env
+        initial_gbest = copy.deepcopy(base_env)
+        logger.info(f"Initial solution energy: {_get_initial_solution_energy(base_env)}")
+        solver = ELP(
+            env=base_env,
+            gbest=initial_gbest,
+            T=T_initial,
+            G=G,
+            t_max=t_max,
+            k=k_hist,
+        )
+        if baseline_enabled:
+            return solver, solver.run_moea_baseline(
+                algorithm_name=baseline_algo,
+                population_size=baseline_population,
+                generations=baseline_generations,
+                sequence_length=baseline_sequence_length,
+                seed=run_seed,
+            )
+        return solver, solver.run()
 
     if is_exp:
         for i in range(exp_number):
             logger.info(f"Starting experiment {i + 1} for {exp_algorithm}")
             try:
-                env = gym.make("FbsEnv-v0", instance=exp_instance)
-                env.reset()
-                base_env = env.unwrapped if hasattr(env, "unwrapped") else env
-                initial_gbest = copy.deepcopy(base_env)
-                logger.info(f"Initial solution energy: {_get_initial_solution_energy(base_env)}")
-                elp_solver = ELP(
-                    env=base_env,
-                    gbest=initial_gbest,
-                    T=T_initial,
-                    G=G,
-                    t_max=t_max,
-                    k=k_hist,
-                )
-                total_iter, is_valid, best_sol, best_energy, start, end, fast = elp_solver.run()
-                logger.info(f"Experiment {i + 1} complete | representative decision score: {best_energy}")
-                for telemetry_line in elp_solver.format_action_telemetry():
-                    logger.info(f"Telemetry | {telemetry_line}")
+                elp_solver, result_tuple = _run_once(i)
+                total_iter, is_valid, best_sol, best_energy, start, end, fast = result_tuple
+                logger.info(f"Experiment {i + 1} complete | {_format_summary_metrics(elp_solver, best_energy)}")
+                if not baseline_enabled:
+                    for telemetry_line in elp_solver.format_action_telemetry():
+                        logger.info(f"Telemetry | {telemetry_line}")
                 _save_experiment_row(
                     exp_instance,
                     exp_algorithm,
@@ -1552,23 +2796,12 @@ if __name__ == "__main__":
             except Exception as exc:
                 logger.exception(f"Experiment {i + 1} failed: {exc}")
     else:
-        env = gym.make("FbsEnv-v0", instance=exp_instance)
-        env.reset()
-        base_env = env.unwrapped if hasattr(env, "unwrapped") else env
-        initial_gbest = copy.deepcopy(base_env)
-        logger.info(f"Initial solution energy: {_get_initial_solution_energy(base_env)}")
-        elp_solver = ELP(
-            env=base_env,
-            gbest=initial_gbest,
-            T=T_initial,
-            G=G,
-            t_max=t_max,
-            k=k_hist,
-        )
-        total_iter, is_valid, best_sol, best_energy, start, end, fast = elp_solver.run()
-        print(f"Single run complete | representative decision score: {best_energy}")
-        for telemetry_line in elp_solver.format_action_telemetry():
-            print(telemetry_line)
+        elp_solver, result_tuple = _run_once(0)
+        total_iter, is_valid, best_sol, best_energy, start, end, fast = result_tuple
+        print(f"Single run complete | {_format_summary_metrics(elp_solver, best_energy)}")
+        if not baseline_enabled:
+            for telemetry_line in elp_solver.format_action_telemetry():
+                print(telemetry_line)
         _save_experiment_row(
             exp_instance,
             exp_algorithm,
