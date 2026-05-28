@@ -2372,24 +2372,66 @@ def calculate_d_inf(fac_b, fac_h, area, fac_limit_aspect):
     return d_inf, infeasible_mask, lower_bounds, upper_bounds, aspect_limits
 
 
-def calculate_cost(mhc, fac_b, fac_h, area, fac_limit_aspect, v_worst=None, k_penalty=1):
-    d_inf, infeasible_mask, lower_bounds, upper_bounds, aspect_limits = calculate_d_inf(
+def calculate_cost(
+    mhc,
+    fac_b,
+    fac_h,
+    area,
+    fac_limit_aspect,
+    v_ref=None,
+    v_worst=None,
+    k_penalty=0.5,
+    tau=0.2,
+    alpha=0.7,
+    beta=10.0,
+):
+    if v_ref is None and v_worst is not None:
+        v_ref = v_worst
+    _d_inf_unused, _infeasible_mask_unused, lower_bounds, upper_bounds, aspect_limits = calculate_d_inf(
         fac_b, fac_h, area, fac_limit_aspect
     )
     widths = np.asarray(fac_b, dtype=float).reshape(-1)
     heights = np.asarray(fac_h, dtype=float).reshape(-1)
     short_side = np.minimum(widths, heights)
     long_side = np.maximum(widths, heights)
-    short_violation = np.maximum(lower_bounds - short_side, 0.0)
-    long_violation = np.maximum(long_side - upper_bounds, 0.0)
-    violation_sum = float(np.sum(short_violation + long_violation))
+    aspect_ratio = np.divide(
+        long_side,
+        np.maximum(short_side, 1e-12),
+        out=np.full_like(long_side, np.inf, dtype=float),
+        where=short_side > 0,
+    )
+    aspect_limit_arr = np.asarray(aspect_limits, dtype=float).reshape(-1)
+    if aspect_limit_arr.size != aspect_ratio.size:
+        aspect_limit_arr = np.full(aspect_ratio.shape, np.inf, dtype=float)
+    valid_limits = np.isfinite(aspect_limit_arr) & (aspect_limit_arr > 0.0)
+    delta = np.zeros_like(aspect_ratio, dtype=float)
+    delta[valid_limits] = np.maximum(
+        0.0,
+        (aspect_ratio[valid_limits] - aspect_limit_arr[valid_limits]) / aspect_limit_arr[valid_limits],
+    )
+    infeasible_mask = delta > 0.0
+    d_inf = int(np.sum(infeasible_mask))
+    tau_value = max(float(tau), 0.0)
+    alpha_value = max(float(alpha), 0.0)
+    beta_value = max(float(beta), 0.0)
+    phi = np.zeros_like(delta, dtype=float)
+    linear_mask = (delta > 0.0) & (delta <= tau_value)
+    phi[linear_mask] = alpha_value * delta[linear_mask]
+    quadratic_mask = delta > tau_value
+    phi[quadratic_mask] = (
+        alpha_value * delta[quadratic_mask]
+        + beta_value * np.square(delta[quadratic_mask] - tau_value)
+    )
+    violation_sum = float(np.sum(phi))
     mhc_value = float(mhc)
     if d_inf == 0:
         cost = mhc_value
-    elif v_worst is None or not np.isfinite(v_worst) or float(v_worst) <= 0:
-        cost = float("inf")
     else:
-        cost = mhc_value + (d_inf ** int(k_penalty)) * float(v_worst)
+        if v_ref is None or not np.isfinite(v_ref) or float(v_ref) <= 0.0:
+            ref_cost = mhc_value
+        else:
+            ref_cost = float(v_ref)
+        cost = mhc_value + float(k_penalty) * ref_cost * violation_sum
     return {
         "cost": cost,
         "d_inf": d_inf,
@@ -2398,6 +2440,8 @@ def calculate_cost(mhc, fac_b, fac_h, area, fac_limit_aspect, v_worst=None, k_pe
         "upper_bounds": upper_bounds,
         "aspect_limits": aspect_limits,
         "violation_sum": violation_sum,
+        "v_ref": None if v_ref is None else float(v_ref),
+        "v_worst": None if v_ref is None else float(v_ref),
     }
 
 
@@ -2407,8 +2451,12 @@ def evaluate_layout(
     H,
     F,
     fac_limit_aspect,
+    v_ref=None,
     v_worst=None,
-    k_penalty=1,
+    k_penalty=0.5,
+    tau=0.2,
+    alpha=0.7,
+    beta=10.0,
     distance_metric="manhattan",
 ):
     fac_x, fac_y, fac_b, fac_h = getCoordinates_mao(fbs_model, area, H)
@@ -2431,8 +2479,12 @@ def evaluate_layout(
         fac_h,
         area,
         fac_limit_aspect,
+        v_ref=v_ref,
         v_worst=v_worst,
         k_penalty=k_penalty,
+        tau=tau,
+        alpha=alpha,
+        beta=beta,
     )
     return {
         "fac_x": fac_x,
@@ -2451,7 +2503,8 @@ def evaluate_layout(
         "aspect_limits": cost_data["aspect_limits"],
         "violation_sum": cost_data["violation_sum"],
         "is_feasible": cost_data["d_inf"] == 0,
-        "v_worst": None if v_worst is None else float(v_worst),
+        "v_ref": None if (v_ref is None and v_worst is None) else float(v_ref if v_ref is not None else v_worst),
+        "v_worst": None if (v_ref is None and v_worst is None) else float(v_ref if v_ref is not None else v_worst),
     }
 
 
@@ -2461,8 +2514,12 @@ def evaluate_layout_fast(
     H,
     F,
     fac_limit_aspect,
+    v_ref=None,
     v_worst=None,
-    k_penalty=1,
+    k_penalty=0.5,
+    tau=0.2,
+    alpha=0.7,
+    beta=10.0,
     distance_metric="manhattan",
 ):
     fac_x, fac_y, fac_b, fac_h = getCoordinates_mao_fast(fbs_model, area, H)
@@ -2485,8 +2542,12 @@ def evaluate_layout_fast(
         fac_h,
         area,
         fac_limit_aspect,
+        v_ref=v_ref,
         v_worst=v_worst,
         k_penalty=k_penalty,
+        tau=tau,
+        alpha=alpha,
+        beta=beta,
     )
     return {
         "fac_x": fac_x,
@@ -2505,5 +2566,6 @@ def evaluate_layout_fast(
         "aspect_limits": cost_data["aspect_limits"],
         "violation_sum": cost_data["violation_sum"],
         "is_feasible": cost_data["d_inf"] == 0,
-        "v_worst": None if v_worst is None else float(v_worst),
+        "v_ref": None if (v_ref is None and v_worst is None) else float(v_ref if v_ref is not None else v_worst),
+        "v_worst": None if (v_ref is None and v_worst is None) else float(v_ref if v_ref is not None else v_worst),
     }

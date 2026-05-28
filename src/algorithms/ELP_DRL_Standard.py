@@ -120,7 +120,7 @@ class StandardQLearningAgent:
         self.gamma = float(gamma)
         self.Q = np.zeros((s_dim, a_dim), dtype=float)
 
-    def select_action(self, s, deterministic=False, allowed_actions=None):
+    def select_action(self, s, deterministic=False, allowed_actions=None, context_features=None):
         if allowed_actions is None or len(allowed_actions) == 0:
             allowed_actions = list(range(self.a_dim))
         allowed_actions = np.asarray(allowed_actions, dtype=int).reshape(-1)
@@ -162,12 +162,14 @@ class _ReplayBuffer:
 
     def sample(self, batch_size):
         batch = random.sample(self.storage, int(batch_size))
-        states, actions, rewards, next_states, dones, next_masks, gamma_ns = zip(*batch)
+        states, state_contexts, actions, rewards, next_states, next_state_contexts, dones, next_masks, gamma_ns = zip(*batch)
         return (
             np.asarray(states, dtype=np.int64),
+            np.asarray(state_contexts, dtype=np.float32),
             np.asarray(actions, dtype=np.int64),
             np.asarray(rewards, dtype=np.float32),
             np.asarray(next_states, dtype=np.int64),
+            np.asarray(next_state_contexts, dtype=np.float32),
             np.asarray(dones, dtype=np.float32),
             np.asarray(next_masks, dtype=np.bool_),
             np.asarray(gamma_ns, dtype=np.float32),
@@ -181,23 +183,35 @@ _QNetworkBase = nn.Module if nn is not None else object
 
 
 class _QNetwork(_QNetworkBase):
-    def __init__(self, state_dim, action_dim, embedding_dim=32, hidden_dim=64):
+    def __init__(self, state_dim, action_dim, embedding_dim=32, hidden_dim=64, context_dim=0):
         if nn is None:
             raise ImportError('PyTorch is not available. Set ELP_RL_AGENT=qlearning or install torch.')
         super().__init__()
         self.state_dim = int(state_dim)
+        self.context_dim = int(max(0, context_dim))
         self.embedding = nn.Embedding(self.state_dim, int(embedding_dim))
+        input_dim = int(embedding_dim) + self.context_dim
         self.layers = nn.Sequential(
-            nn.Linear(int(embedding_dim), int(hidden_dim)),
+            nn.Linear(int(input_dim), int(hidden_dim)),
             nn.ReLU(),
             nn.Linear(int(hidden_dim), int(hidden_dim)),
             nn.ReLU(),
             nn.Linear(int(hidden_dim), int(action_dim)),
         )
 
-    def forward(self, state_idx):
+    def forward(self, state_idx, context_features=None):
         idx = state_idx.long().clamp(0, self.state_dim - 1)
         features = self.embedding(idx)
+        if self.context_dim > 0:
+            if context_features is None:
+                context = torch.zeros((features.shape[0], self.context_dim), dtype=features.dtype, device=features.device)
+            else:
+                context = context_features.to(device=features.device, dtype=features.dtype)
+                if context.dim() == 1:
+                    context = context.unsqueeze(0)
+                if context.shape[1] != self.context_dim:
+                    raise ValueError(f"context feature dim mismatch: expected {self.context_dim}, got {context.shape[1]}")
+            features = torch.cat((features, context), dim=1)
         return self.layers(features)
 
 
@@ -221,6 +235,7 @@ class StandardDQNAgent:
         idqn_k=2,
         embedding_dim=32,
         hidden_dim=64,
+        context_dim=0,
         grad_clip=10.0,
         step_epsilon_schedule=False,
         epsilon_warmup_steps=0,
@@ -245,6 +260,7 @@ class StandardDQNAgent:
         self.update_every = int(max(1, update_every))
         self.target_update_every = int(max(1, target_update_every))
         self.idqn_k = int(max(1, idqn_k))
+        self.context_dim = int(max(0, context_dim))
         self.grad_clip = float(max(0.0, grad_clip))
 
         self.device = torch.device('cpu')
@@ -253,12 +269,14 @@ class StandardDQNAgent:
             self.a_dim,
             embedding_dim=embedding_dim,
             hidden_dim=hidden_dim,
+            context_dim=self.context_dim,
         ).to(self.device)
         self.target_net = _QNetwork(
             self.s_dim,
             self.a_dim,
             embedding_dim=embedding_dim,
             hidden_dim=hidden_dim,
+            context_dim=self.context_dim,
         ).to(self.device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
@@ -273,6 +291,16 @@ class StandardDQNAgent:
         self.n_step_buffer = deque(maxlen=self.idqn_k)
         self.total_steps = 0
         self.optimize_steps = 0
+
+    def _normalize_context_features(self, context_features):
+        if self.context_dim <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        if context_features is None:
+            return np.zeros((self.context_dim,), dtype=np.float32)
+        context = np.asarray(context_features, dtype=np.float32).reshape(-1)
+        if context.size != self.context_dim:
+            raise ValueError(f"context feature dim mismatch: expected {self.context_dim}, got {context.size}")
+        return context
 
     def _build_action_mask(self, allowed_actions):
         mask = np.zeros(self.a_dim, dtype=np.bool_)
@@ -296,7 +324,7 @@ class StandardDQNAgent:
         fallback = q_values.argmax(dim=1)
         return torch.where(has_valid, greedy, fallback)
 
-    def select_action(self, s, deterministic=False, allowed_actions=None):
+    def select_action(self, s, deterministic=False, allowed_actions=None, context_features=None):
         if allowed_actions is None or len(allowed_actions) == 0:
             allowed_actions = list(range(self.a_dim))
         allowed_actions = np.asarray(allowed_actions, dtype=int).reshape(-1)
@@ -312,7 +340,14 @@ class StandardDQNAgent:
 
         with torch.no_grad():
             state_tensor = torch.tensor([int(s)], dtype=torch.long, device=self.device)
-            q_values = self.online_net(state_tensor).squeeze(0).detach().cpu().numpy()
+            context_tensor = None
+            if self.context_dim > 0:
+                context_tensor = torch.tensor(
+                    self._normalize_context_features(context_features),
+                    dtype=torch.float32,
+                    device=self.device,
+                ).unsqueeze(0)
+            q_values = self.online_net(state_tensor, context_features=context_tensor).squeeze(0).detach().cpu().numpy()
 
         q_values = q_values + self.action_q_bias
         candidate_q = np.take(q_values, allowed_actions)
@@ -347,19 +382,21 @@ class StandardDQNAgent:
         return self.epsilon
 
     def _build_n_step_transition(self):
-        state0, action0, _, _, _, _ = self.n_step_buffer[0]
+        state0, state_context0, action0, _, _, _, _, _ = self.n_step_buffer[0]
         total_reward = 0.0
         discount = 1.0
-        next_state = int(self.n_step_buffer[0][3])
+        next_state = int(self.n_step_buffer[0][4])
+        next_state_context = self.n_step_buffer[0][5]
         done_flag = False
-        next_mask = self.n_step_buffer[0][5]
+        next_mask = self.n_step_buffer[0][7]
 
         horizon = min(self.idqn_k, len(self.n_step_buffer))
         for idx in range(horizon):
-            _, _, reward_i, next_state_i, done_i, next_mask_i = self.n_step_buffer[idx]
+            _, _, _, reward_i, next_state_i, next_state_context_i, done_i, next_mask_i = self.n_step_buffer[idx]
             total_reward += discount * float(reward_i)
             discount *= self.gamma
             next_state = int(next_state_i)
+            next_state_context = next_state_context_i
             done_flag = bool(done_i)
             next_mask = next_mask_i
             if done_flag:
@@ -368,20 +405,24 @@ class StandardDQNAgent:
         gamma_n = 0.0 if done_flag else float(discount)
         return (
             int(state0),
+            np.asarray(state_context0, dtype=np.float32),
             int(action0),
             float(total_reward),
             int(next_state),
+            np.asarray(next_state_context, dtype=np.float32),
             bool(done_flag),
             np.asarray(next_mask, dtype=np.bool_),
             float(gamma_n),
         )
 
-    def _append_transition(self, s, a, reward, s_next, done, allowed_next_actions):
+    def _append_transition(self, s, a, reward, s_next, done, allowed_next_actions, state_context=None, next_state_context=None):
         transition = (
             int(s),
+            self._normalize_context_features(state_context),
             int(a),
             float(reward),
             int(s_next),
+            self._normalize_context_features(next_state_context),
             bool(done),
             self._build_action_mask(allowed_next_actions),
         )
@@ -402,22 +443,24 @@ class StandardDQNAgent:
         if self.total_steps % self.update_every != 0:
             return None
 
-        states, actions, rewards, next_states, dones, next_masks, gamma_ns = self.replay.sample(self.batch_size)
+        states, state_contexts, actions, rewards, next_states, next_state_contexts, dones, next_masks, gamma_ns = self.replay.sample(self.batch_size)
 
         states_t = torch.tensor(states, dtype=torch.long, device=self.device)
+        state_contexts_t = torch.tensor(state_contexts, dtype=torch.float32, device=self.device)
         actions_t = torch.tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
         rewards_t = torch.tensor(rewards, dtype=torch.float32, device=self.device)
         next_states_t = torch.tensor(next_states, dtype=torch.long, device=self.device)
+        next_state_contexts_t = torch.tensor(next_state_contexts, dtype=torch.float32, device=self.device)
         dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
         gamma_ns_t = torch.tensor(gamma_ns, dtype=torch.float32, device=self.device)
         next_masks_t = torch.tensor(next_masks, dtype=torch.bool, device=self.device)
 
-        q_current = self.online_net(states_t).gather(1, actions_t).squeeze(1)
+        q_current = self.online_net(states_t, context_features=state_contexts_t).gather(1, actions_t).squeeze(1)
 
         with torch.no_grad():
-            q_online_next = self.online_net(next_states_t)
+            q_online_next = self.online_net(next_states_t, context_features=next_state_contexts_t)
             next_actions = self._masked_argmax(q_online_next, next_masks_t).unsqueeze(1)
-            q_target_next = self.target_net(next_states_t).gather(1, next_actions).squeeze(1)
+            q_target_next = self.target_net(next_states_t, context_features=next_state_contexts_t).gather(1, next_actions).squeeze(1)
             targets = rewards_t + (1.0 - dones_t) * gamma_ns_t * q_target_next
 
         loss = self.loss_fn(q_current, targets)
@@ -433,9 +476,18 @@ class StandardDQNAgent:
 
         return float(loss.item())
 
-    def update_Q(self, s, a, reward, s_next, done=False, allowed_next_actions=None):
+    def update_Q(self, s, a, reward, s_next, done=False, allowed_next_actions=None, state_context=None, next_state_context=None):
         self.total_steps += 1
-        self._append_transition(s, a, reward, s_next, done, allowed_next_actions)
+        self._append_transition(
+            s,
+            a,
+            reward,
+            s_next,
+            done,
+            allowed_next_actions,
+            state_context=state_context,
+            next_state_context=next_state_context,
+        )
         return self._optimize()
 
     def decay_epsilon(self):
@@ -447,22 +499,26 @@ class StandardDQNAgent:
     def finalize_episode(self):
         # Flush residual n-step transitions at episode boundary to avoid cross-episode leakage.
         while self.n_step_buffer:
-            state0, action0, _, _, _, _ = self.n_step_buffer[0]
+            state0, state_context0, action0, _, _, _, _, _ = self.n_step_buffer[0]
             total_reward = 0.0
             discount = 1.0
-            next_state = int(self.n_step_buffer[0][3])
-            next_mask = self.n_step_buffer[0][5]
+            next_state = int(self.n_step_buffer[0][4])
+            next_state_context = self.n_step_buffer[0][5]
+            next_mask = self.n_step_buffer[0][7]
             for idx in range(len(self.n_step_buffer)):
-                _, _, reward_i, next_state_i, _done_i, next_mask_i = self.n_step_buffer[idx]
+                _, _, _, reward_i, next_state_i, next_state_context_i, _done_i, next_mask_i = self.n_step_buffer[idx]
                 total_reward += discount * float(reward_i)
                 discount *= self.gamma
                 next_state = int(next_state_i)
+                next_state_context = next_state_context_i
                 next_mask = next_mask_i
             self.replay.add((
                 int(state0),
+                np.asarray(state_context0, dtype=np.float32),
                 int(action0),
                 float(total_reward),
                 int(next_state),
+                np.asarray(next_state_context, dtype=np.float32),
                 True,
                 np.asarray(next_mask, dtype=np.bool_),
                 0.0,

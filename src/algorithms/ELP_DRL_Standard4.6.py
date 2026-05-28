@@ -306,7 +306,14 @@ class ELP:
         self.G = int(G)
         self.t_max = int(t_max)
         self.k_hist = float(k)
-        self.k_penalty = 1
+        self.k_penalty = max(0.0, float(_env_float("ELP_TRUE_COST_K_PENALTY", 0.5)))
+        self.true_cost_tau = max(0.0, float(_env_float("ELP_TRUE_COST_TAU", 0.2)))
+        self.true_cost_alpha = max(0.0, float(_env_float("ELP_TRUE_COST_ALPHA", 0.7)))
+        self.true_cost_beta = max(0.0, float(_env_float("ELP_TRUE_COST_BETA", 10.0)))
+        self.true_cost_ema_alpha = min(
+            1.0,
+            max(0.0, float(_env_float("ELP_TRUE_COST_EMA_ALPHA", 0.05))),
+        )
         self.use_fast_evaluate = _env_flag("ELP_USE_FAST_EVALUATE", True)
         self.cooling_per_episode = min(
             1.0,
@@ -488,25 +495,38 @@ class ELP:
                 float(_runtime_default("reward_eval_cost_penalty", 0.02)),
             ),
         )
-        self.search_cost_penalty_early = max(
+        self.exploratory_guard_d_inf_cap_early = max(
+            0,
+            int(_runtime_default("exploratory_guard_d_inf_cap_early", 2)),
+        )
+        self.exploratory_guard_d_inf_cap_mid = max(
+            0,
+            min(
+                self.exploratory_guard_d_inf_cap_early,
+                int(_runtime_default("exploratory_guard_d_inf_cap_mid", 1)),
+            ),
+        )
+        self.exploratory_guard_violation_ratio_cap_early = max(
             0.0,
-            float(_runtime_default("search_cost_penalty_early", 0.04)),
+            float(_runtime_default("exploratory_guard_violation_ratio_cap_early", 0.060)),
         )
-        self.search_cost_penalty_mid = max(
-            self.search_cost_penalty_early,
-            float(_runtime_default("search_cost_penalty_mid", 0.10)),
-        )
-        self.search_cost_penalty_late = max(
-            self.search_cost_penalty_mid,
-            float(_runtime_default("search_cost_penalty_late", 0.30)),
-        )
-        self.search_cost_d_inf_weight = max(
+        self.exploratory_guard_violation_ratio_cap_mid = max(
             0.0,
-            float(_runtime_default("search_cost_d_inf_weight", 1.0)),
+            min(
+                self.exploratory_guard_violation_ratio_cap_early,
+                float(_runtime_default("exploratory_guard_violation_ratio_cap_mid", 0.030)),
+            ),
         )
-        self.search_cost_violation_weight = max(
+        self.exploratory_guard_geometry_worse_cap_early = max(
             0.0,
-            float(_runtime_default("search_cost_violation_weight", 0.35)),
+            float(_runtime_default("exploratory_guard_geometry_worse_cap_early", 0.020)),
+        )
+        self.exploratory_guard_geometry_worse_cap_mid = max(
+            0.0,
+            min(
+                self.exploratory_guard_geometry_worse_cap_early,
+                float(_runtime_default("exploratory_guard_geometry_worse_cap_mid", 0.010)),
+            ),
         )
         self._standard46_current_candidate_cap = self.new_action_candidate_cap
         self._standard46_current_action_eval_count = 0
@@ -641,6 +661,9 @@ class ELP:
         self.feasible_solution_count = 0
         self.best_feasible_cost = np.inf
         self.worst_feasible_cost = None
+        self.current_v_ref = None
+        self.v_ref_bootstrap_sum = 0.0
+        self.v_ref_bootstrap_count = 0
         self.best_feasible_solution = None
         self.action_telemetry = {
             action_idx: self._new_action_telemetry_entry(action_idx)
@@ -1429,6 +1452,39 @@ class ELP:
             }
             for action_idx in sorted(self.two_stage_heavy_action_ids)
         }
+        self.light_action_diagnostics = {
+            action_idx: {
+                "calls": 0,
+                "generated_total": 0,
+                "generated_infeasible_proxy": 0,
+                "guard_rejected": 0,
+                "guard_passed_total": 0,
+                "guard_passed_infeasible_proxy": 0,
+                "added_total": 0,
+                "added_feasible": 0,
+                "added_infeasible": 0,
+                "best_total": 0,
+                "best_feasible": 0,
+                "best_infeasible": 0,
+                "fallback_clone": 0,
+            }
+            for action_idx in (4, 5)
+        }
+        self.infeasible_acceptance_diagnostics = {
+            action_idx: {
+                "count": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "prob_sum": 0.0,
+                "search_delta_sum": 0.0,
+                "true_delta_sum": 0.0,
+                "d_inf_sum": 0.0,
+                "violation_sum": 0.0,
+                "current_search_sum": 0.0,
+                "candidate_search_sum": 0.0,
+            }
+            for action_idx in (4, 5)
+        }
 
         logger.info(
             f"Runtime config applied | config: {self.runtime_config_name} | "
@@ -1437,7 +1493,10 @@ class ELP:
             f"bin_width: {self.bin_width:.6f} | adaptive_bin_width: {self.adaptive_bin_width_enabled} | "
             f"reward: {self.reward_profile} | "
             f"train_reward_mix: {self.reward_train_immediate_weight:.2f}/{self.reward_train_final_weight:.2f} | "
-            f"search_penalty: E{self.search_cost_penalty_early:.3f}/M{self.search_cost_penalty_mid:.3f}/L{self.search_cost_penalty_late:.3f} | "
+            f"true_cost: tau={self.true_cost_tau:.3f}/alpha={self.true_cost_alpha:.3f}/beta={self.true_cost_beta:.3f}/ema={self.true_cost_ema_alpha:.3f} | "
+            f"explore_guard: d_inf(E{self.exploratory_guard_d_inf_cap_early}/M{self.exploratory_guard_d_inf_cap_mid}) "
+            f"viol(E{self.exploratory_guard_violation_ratio_cap_early:.3f}/M{self.exploratory_guard_violation_ratio_cap_mid:.3f}) "
+            f"geom(E{self.exploratory_guard_geometry_worse_cap_early:.3f}/M{self.exploratory_guard_geometry_worse_cap_mid:.3f}) | "
             f"two_stage_eval: {'learned' if self.two_stage_learned_evaluator_enabled else 'proxy'}"
         )
 
@@ -1451,8 +1510,14 @@ class ELP:
         self.current_energy = self.s.fitness
         self.infeasible_step_count = 0
         self.infeasible_entry_count = 0
+        self.infeasible_selection_step_count = 0
+        self.infeasible_selection_entry_count = 0
+        self.post_action_infeasible_step_count = 0
+        self.post_action_infeasible_entry_count = 0
         self.max_d_inf_seen = 0
         self._last_recorded_action_mode = None
+        self._last_selection_action_mode = None
+        self._last_post_action_mode = None
         self._record_action_mode_visit(self.s)
         if np.isfinite(self.current_energy):
             self._update_histogram(self.current_energy)
@@ -1460,7 +1525,10 @@ class ELP:
             self.modified_energy_history.append(self._tilde_energy(self.current_energy))
 
     def _sync_solution_metrics(self, solution, metrics):
-        search_cost = self._compute_search_cost(solution, metrics)
+        mhc_value = float(metrics.get("mhc", np.inf))
+        if np.isfinite(mhc_value):
+            self.v_ref_bootstrap_sum += mhc_value
+            self.v_ref_bootstrap_count += 1
         solution.fac_x = metrics["fac_x"]
         solution.fac_y = metrics["fac_y"]
         solution.fac_b = metrics["fac_b"]
@@ -1473,17 +1541,34 @@ class ELP:
         solution.TM = metrics["TM"]
         solution.MHC = metrics["mhc"]
         solution.true_fitness = metrics["cost"]
-        solution.search_fitness = search_cost
+        solution.search_fitness = solution.true_fitness
         solution.violation_sum = float(metrics.get("violation_sum", 0.0))
-        solution.fitness = search_cost
+        solution.fitness = solution.true_fitness
         solution.current_d_inf = metrics["d_inf"]
         solution.current_is_feasible = metrics["is_feasible"]
-        solution.current_v_worst = self.worst_feasible_cost
+        solution.current_v_ref = self.current_v_ref
+        solution.current_v_worst = self.current_v_ref
         solution.feasible_solution_count = self.feasible_solution_count
         solution.best_feasible_cost = self.best_feasible_cost
         solution.worst_feasible_cost = self.worst_feasible_cost
         solution.best_fitness = self.best_feasible_cost
         solution.state = solution.constructState()
+
+    def _current_true_cost_v_ref(self):
+        current_v_ref = getattr(self, "current_v_ref", None)
+        try:
+            current_v_ref = float(current_v_ref)
+        except Exception:
+            current_v_ref = float("inf")
+        if np.isfinite(current_v_ref) and current_v_ref > 0.0:
+            return current_v_ref
+        bootstrap_count = int(getattr(self, "v_ref_bootstrap_count", 0))
+        bootstrap_sum = float(getattr(self, "v_ref_bootstrap_sum", 0.0))
+        if bootstrap_count > 0 and np.isfinite(bootstrap_sum):
+            bootstrap_mean = bootstrap_sum / float(bootstrap_count)
+            if np.isfinite(bootstrap_mean) and bootstrap_mean > 0.0:
+                return float(bootstrap_mean)
+        return None
 
     def _phase_prefix(self, phase):
         return "elite_" if phase == "elite" else ""
@@ -1531,48 +1616,90 @@ class ELP:
         self._last_recorded_action_mode = action_mode
         return action_mode
 
-    def _compute_search_cost(self, solution, metrics):
-        true_cost = float(metrics.get("cost", np.inf))
-        mhc = float(metrics.get("mhc", np.inf))
-        d_inf = max(0, int(metrics.get("d_inf", 0)))
-        if d_inf <= 0:
-            return true_cost if np.isfinite(true_cost) else mhc
+    def _update_max_d_inf_seen(self, solution):
+        current_d_inf = max(0, int(getattr(solution, "current_d_inf", 0)))
+        self.max_d_inf_seen = max(int(getattr(self, "max_d_inf_seen", 0)), current_d_inf)
+        return current_d_inf
 
+    def _record_selection_action_mode(self, solution):
+        action_mode = self._current_action_mode(solution)
+        self._update_max_d_inf_seen(solution)
+        previous_mode = getattr(self, "_last_selection_action_mode", None)
+        if action_mode == "infeasible":
+            self.infeasible_selection_step_count = int(
+                getattr(self, "infeasible_selection_step_count", 0)
+            ) + 1
+            if previous_mode != "infeasible":
+                self.infeasible_selection_entry_count = int(
+                    getattr(self, "infeasible_selection_entry_count", 0)
+                ) + 1
+        self._last_selection_action_mode = action_mode
+        self.infeasible_step_count = int(getattr(self, "infeasible_selection_step_count", 0))
+        self.infeasible_entry_count = int(getattr(self, "infeasible_selection_entry_count", 0))
+        return action_mode
+
+    def _record_post_action_mode(self, solution):
+        action_mode = self._current_action_mode(solution)
+        self._update_max_d_inf_seen(solution)
+        previous_mode = getattr(self, "_last_post_action_mode", None)
+        if action_mode == "infeasible":
+            self.post_action_infeasible_step_count = int(
+                getattr(self, "post_action_infeasible_step_count", 0)
+            ) + 1
+            if previous_mode != "infeasible":
+                self.post_action_infeasible_entry_count = int(
+                    getattr(self, "post_action_infeasible_entry_count", 0)
+                ) + 1
+        self._last_post_action_mode = action_mode
+        return action_mode
+
+    def _standard46_exploratory_guard_limits(self):
         phase_name = self._current_progress_phase_name()
-        phase_scale = {
-            "early": float(self.search_cost_penalty_early),
-            "mid": float(self.search_cost_penalty_mid),
-            "late": float(self.search_cost_penalty_late),
-        }.get(phase_name, float(self.search_cost_penalty_mid))
+        if phase_name == "early":
+            return {
+                "d_inf_cap": int(self.exploratory_guard_d_inf_cap_early),
+                "violation_ratio_cap": float(self.exploratory_guard_violation_ratio_cap_early),
+                "geometry_worse_cap": float(self.exploratory_guard_geometry_worse_cap_early),
+            }
+        if phase_name == "mid":
+            return {
+                "d_inf_cap": int(self.exploratory_guard_d_inf_cap_mid),
+                "violation_ratio_cap": float(self.exploratory_guard_violation_ratio_cap_mid),
+                "geometry_worse_cap": float(self.exploratory_guard_geometry_worse_cap_mid),
+            }
+        return {
+            "d_inf_cap": 0,
+            "violation_ratio_cap": 0.0,
+            "geometry_worse_cap": 0.0,
+        }
 
-        reference_cost = getattr(self, "best_feasible_cost", np.inf)
-        try:
-            reference_cost = float(reference_cost)
-        except Exception:
-            reference_cost = float("inf")
-        if not np.isfinite(reference_cost):
-            reference_cost = getattr(self, "worst_feasible_cost", np.inf)
-            try:
-                reference_cost = float(reference_cost)
-            except Exception:
-                reference_cost = float("inf")
-        if not np.isfinite(reference_cost):
-            reference_cost = mhc if np.isfinite(mhc) else true_cost
-        reference_cost = max(abs(float(reference_cost)) if np.isfinite(reference_cost) else 0.0, 1.0)
-
-        areas = np.asarray(getattr(solution, "areas", []), dtype=float).reshape(-1)
-        if areas.size > 0:
-            linear_scale = float(np.sum(np.sqrt(np.maximum(areas, 1e-8))))
+    def _standard46_allow_guarded_light_infeasible_candidate(
+        self,
+        context,
+        base_is_feasible,
+        candidate_d_inf_proxy,
+        base_d_inf_proxy,
+        candidate_violation_proxy,
+        geometry_worse,
+    ):
+        if not base_is_feasible:
+            return int(candidate_d_inf_proxy) <= int(base_d_inf_proxy)
+        if int(candidate_d_inf_proxy) <= 0:
+            return bool(float(geometry_worse) <= 1e-8)
+        limits = self._standard46_exploratory_guard_limits()
+        if int(candidate_d_inf_proxy) > int(limits["d_inf_cap"]):
+            return False
+        if float(geometry_worse) > float(limits["geometry_worse_cap"]):
+            return False
+        area_array = np.asarray(context.get("areas", []), dtype=float).reshape(-1)
+        if area_array.size > 0:
+            linear_scale = float(np.sum(np.sqrt(np.maximum(area_array, 1e-8))))
         else:
-            linear_scale = float(max(1.0, math.sqrt(max(reference_cost, 1.0))))
-        violation_sum = max(0.0, float(metrics.get("violation_sum", 0.0)))
-        violation_ratio = violation_sum / max(linear_scale, 1.0)
-
-        penalty_term = (
-            float(self.search_cost_d_inf_weight) * math.log1p(float(d_inf))
-            + float(self.search_cost_violation_weight) * math.log1p(max(0.0, violation_ratio) * 10.0)
-        )
-        return float(mhc + phase_scale * reference_cost * penalty_term)
+            linear_scale = 1.0
+        violation_ratio = float(candidate_violation_proxy) / max(linear_scale, 1.0)
+        if violation_ratio > float(limits["violation_ratio_cap"]):
+            return False
+        return True
 
     def _new_action_telemetry_entry(self, action_idx):
         return {
@@ -1724,6 +1851,49 @@ class ELP:
         prefix = self._phase_prefix(phase)
         stats[f"{prefix}global_best_hits"] += 1
 
+    def _record_light_action_diag(self, action_idx, key, amount=1):
+        diagnostics = getattr(self, "light_action_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return
+        stats = diagnostics.get(int(action_idx))
+        if not isinstance(stats, dict):
+            return
+        stats[key] = int(stats.get(key, 0)) + int(amount)
+
+    def _record_infeasible_acceptance_diag(
+        self,
+        action_idx,
+        accepted,
+        prob,
+        current_cost,
+        candidate_cost,
+        current_true_cost,
+        candidate_true_cost,
+        candidate_d_inf,
+        candidate_violation_sum,
+    ):
+        diagnostics = getattr(self, "infeasible_acceptance_diagnostics", None)
+        if not isinstance(diagnostics, dict):
+            return
+        stats = diagnostics.get(int(action_idx))
+        if not isinstance(stats, dict):
+            return
+        stats["count"] = int(stats.get("count", 0)) + 1
+        if accepted:
+            stats["accepted"] = int(stats.get("accepted", 0)) + 1
+        else:
+            stats["rejected"] = int(stats.get("rejected", 0)) + 1
+        if np.isfinite(prob):
+            stats["prob_sum"] += float(prob)
+        if np.isfinite(current_cost) and np.isfinite(candidate_cost):
+            stats["search_delta_sum"] += float(current_cost - candidate_cost)
+            stats["current_search_sum"] += float(current_cost)
+            stats["candidate_search_sum"] += float(candidate_cost)
+        if np.isfinite(current_true_cost) and np.isfinite(candidate_true_cost):
+            stats["true_delta_sum"] += float(current_true_cost - candidate_true_cost)
+        stats["d_inf_sum"] += float(max(0, int(candidate_d_inf)))
+        stats["violation_sum"] += float(max(0.0, float(candidate_violation_sum)))
+
     def get_action_telemetry(self):
         summary = {}
         for action_idx, stats in self.action_telemetry.items():
@@ -1759,8 +1929,44 @@ class ELP:
             summary[action_idx] = item
         return summary
 
+    def get_light_action_diagnostics(self):
+        diagnostics = {}
+        for action_idx, stats in getattr(self, "light_action_diagnostics", {}).items():
+            item = dict(stats)
+            calls = max(0, int(item.get("calls", 0)))
+            generated_total = max(0, int(item.get("generated_total", 0)))
+            guard_passed_total = max(0, int(item.get("guard_passed_total", 0)))
+            best_total = max(0, int(item.get("best_total", 0)))
+            item["guard_reject_rate"] = 0.0 if generated_total == 0 else float(item.get("guard_rejected", 0)) / float(generated_total)
+            item["guard_pass_rate"] = 0.0 if generated_total == 0 else float(guard_passed_total) / float(generated_total)
+            item["fallback_rate"] = 0.0 if calls == 0 else float(item.get("fallback_clone", 0)) / float(calls)
+            item["best_infeasible_rate"] = 0.0 if best_total == 0 else float(item.get("best_infeasible", 0)) / float(best_total)
+            diagnostics[int(action_idx)] = item
+        return diagnostics
+
+    def get_infeasible_acceptance_diagnostics(self):
+        diagnostics = {}
+        for action_idx, stats in getattr(self, "infeasible_acceptance_diagnostics", {}).items():
+            item = dict(stats)
+            count = max(0, int(item.get("count", 0)))
+            accepted = max(0, int(item.get("accepted", 0)))
+            rejected = max(0, int(item.get("rejected", 0)))
+            item["accept_rate"] = 0.0 if count == 0 else float(accepted) / float(count)
+            item["reject_rate"] = 0.0 if count == 0 else float(rejected) / float(count)
+            item["avg_prob"] = 0.0 if count == 0 else float(item.get("prob_sum", 0.0)) / float(count)
+            item["avg_search_delta"] = 0.0 if count == 0 else float(item.get("search_delta_sum", 0.0)) / float(count)
+            item["avg_true_delta"] = 0.0 if count == 0 else float(item.get("true_delta_sum", 0.0)) / float(count)
+            item["avg_d_inf"] = 0.0 if count == 0 else float(item.get("d_inf_sum", 0.0)) / float(count)
+            item["avg_violation_sum"] = 0.0 if count == 0 else float(item.get("violation_sum", 0.0)) / float(count)
+            item["avg_current_search"] = 0.0 if count == 0 else float(item.get("current_search_sum", 0.0)) / float(count)
+            item["avg_candidate_search"] = 0.0 if count == 0 else float(item.get("candidate_search_sum", 0.0)) / float(count)
+            diagnostics[int(action_idx)] = item
+        return diagnostics
+
     def format_action_telemetry(self):
         telemetry = self.get_action_telemetry()
+        light_diagnostics = self.get_light_action_diagnostics()
+        infeasible_acceptance = self.get_infeasible_acceptance_diagnostics()
         ordered = sorted(
             telemetry.items(),
             key=lambda item: (
@@ -1787,9 +1993,11 @@ class ELP:
                 )
             )
         lines.append(
-            "Action mode stats | infeasible_steps={steps} | infeasible_entries={entries} | max_d_inf_seen={max_d_inf}".format(
-                steps=int(getattr(self, "infeasible_step_count", 0)),
-                entries=int(getattr(self, "infeasible_entry_count", 0)),
+            "Action mode stats | infeasible_select_steps={select_steps} | infeasible_select_entries={select_entries} | post_action_infeasible_steps={post_steps} | post_action_infeasible_entries={post_entries} | max_d_inf_seen={max_d_inf}".format(
+                select_steps=int(getattr(self, "infeasible_selection_step_count", 0)),
+                select_entries=int(getattr(self, "infeasible_selection_entry_count", 0)),
+                post_steps=int(getattr(self, "post_action_infeasible_step_count", 0)),
+                post_entries=int(getattr(self, "post_action_infeasible_entry_count", 0)),
                 max_d_inf=int(getattr(self, "max_d_inf_seen", 0)),
             )
         )
@@ -1811,6 +2019,47 @@ class ELP:
                     step_sched=bool(self.dqn_step_epsilon_schedule),
                     sched_warmup=int(self.dqn_epsilon_schedule_warmup_steps),
                     sched_decay=float(self.dqn_epsilon_schedule_decay_ratio),
+                )
+            )
+        for action_idx in (4, 5):
+            diag_stats = light_diagnostics.get(int(action_idx))
+            if not diag_stats:
+                continue
+            lines.append(
+                "Light diag | Action {action_idx} [{name}] | calls={calls} gen={generated_total} infeas_gen={generated_infeasible_proxy} guard_rej={guard_rejected} guard_pass={guard_passed_total} infeas_pass={guard_passed_infeasible_proxy} added={added_total} add_feas={added_feasible} add_infeas={added_infeasible} best_feas={best_feasible} best_infeas={best_infeasible} fallback={fallback_clone}".format(
+                    action_idx=int(action_idx),
+                    name=self.action_labels[int(action_idx)],
+                    calls=int(diag_stats.get("calls", 0)),
+                    generated_total=int(diag_stats.get("generated_total", 0)),
+                    generated_infeasible_proxy=int(diag_stats.get("generated_infeasible_proxy", 0)),
+                    guard_rejected=int(diag_stats.get("guard_rejected", 0)),
+                    guard_passed_total=int(diag_stats.get("guard_passed_total", 0)),
+                    guard_passed_infeasible_proxy=int(diag_stats.get("guard_passed_infeasible_proxy", 0)),
+                    added_total=int(diag_stats.get("added_total", 0)),
+                    added_feasible=int(diag_stats.get("added_feasible", 0)),
+                    added_infeasible=int(diag_stats.get("added_infeasible", 0)),
+                    best_feasible=int(diag_stats.get("best_feasible", 0)),
+                    best_infeasible=int(diag_stats.get("best_infeasible", 0)),
+                    fallback_clone=int(diag_stats.get("fallback_clone", 0)),
+                )
+            )
+        for action_idx in (4, 5):
+            accept_stats = infeasible_acceptance.get(int(action_idx))
+            if not accept_stats:
+                continue
+            lines.append(
+                "Infeas accept diag | Action {action_idx} [{name}] | count={count} acc={accepted} rej={rejected} acc_rate={accept_rate:.1%} avg_prob={avg_prob:.4f} avg_search_delta={avg_search_delta:.2f} avg_true_delta={avg_true_delta:.2f} avg_d_inf={avg_d_inf:.2f} avg_violation={avg_violation_sum:.4f}".format(
+                    action_idx=int(action_idx),
+                    name=self.action_labels[int(action_idx)],
+                    count=int(accept_stats.get("count", 0)),
+                    accepted=int(accept_stats.get("accepted", 0)),
+                    rejected=int(accept_stats.get("rejected", 0)),
+                    accept_rate=float(accept_stats.get("accept_rate", 0.0)),
+                    avg_prob=float(accept_stats.get("avg_prob", 0.0)),
+                    avg_search_delta=float(accept_stats.get("avg_search_delta", 0.0)),
+                    avg_true_delta=float(accept_stats.get("avg_true_delta", 0.0)),
+                    avg_d_inf=float(accept_stats.get("avg_d_inf", 0.0)),
+                    avg_violation_sum=float(accept_stats.get("avg_violation_sum", 0.0)),
                 )
             )
         for action_idx, stats in ordered:
@@ -1950,6 +2199,8 @@ class ELP:
         fast_time,
     ):
         telemetry = self.get_action_telemetry()
+        light_diagnostics = self.get_light_action_diagnostics()
+        infeasible_acceptance = self.get_infeasible_acceptance_diagnostics()
         rows = []
         run_duration = None
         fast_duration = None
@@ -1974,6 +2225,10 @@ class ELP:
             "elite_total_gain": float(self.elite_total_gain),
             "infeasible_step_count": int(getattr(self, "infeasible_step_count", 0)),
             "infeasible_entry_count": int(getattr(self, "infeasible_entry_count", 0)),
+            "infeasible_selection_step_count": int(getattr(self, "infeasible_selection_step_count", 0)),
+            "infeasible_selection_entry_count": int(getattr(self, "infeasible_selection_entry_count", 0)),
+            "post_action_infeasible_step_count": int(getattr(self, "post_action_infeasible_step_count", 0)),
+            "post_action_infeasible_entry_count": int(getattr(self, "post_action_infeasible_entry_count", 0)),
             "max_d_inf_seen": int(getattr(self, "max_d_inf_seen", 0)),
             "start_time": start_time,
             "end_time": end_time,
@@ -2009,6 +2264,31 @@ class ELP:
             row = dict(common)
             row["action_idx"] = int(action_idx)
             row.update(telemetry[action_idx])
+            row.update(
+                {
+                    "light_diag_calls": int(light_diagnostics.get(int(action_idx), {}).get("calls", 0)),
+                    "light_diag_generated_total": int(light_diagnostics.get(int(action_idx), {}).get("generated_total", 0)),
+                    "light_diag_generated_infeasible_proxy": int(light_diagnostics.get(int(action_idx), {}).get("generated_infeasible_proxy", 0)),
+                    "light_diag_guard_rejected": int(light_diagnostics.get(int(action_idx), {}).get("guard_rejected", 0)),
+                    "light_diag_guard_passed_total": int(light_diagnostics.get(int(action_idx), {}).get("guard_passed_total", 0)),
+                    "light_diag_guard_passed_infeasible_proxy": int(light_diagnostics.get(int(action_idx), {}).get("guard_passed_infeasible_proxy", 0)),
+                    "light_diag_added_total": int(light_diagnostics.get(int(action_idx), {}).get("added_total", 0)),
+                    "light_diag_added_feasible": int(light_diagnostics.get(int(action_idx), {}).get("added_feasible", 0)),
+                    "light_diag_added_infeasible": int(light_diagnostics.get(int(action_idx), {}).get("added_infeasible", 0)),
+                    "light_diag_best_feasible": int(light_diagnostics.get(int(action_idx), {}).get("best_feasible", 0)),
+                    "light_diag_best_infeasible": int(light_diagnostics.get(int(action_idx), {}).get("best_infeasible", 0)),
+                    "light_diag_fallback_clone": int(light_diagnostics.get(int(action_idx), {}).get("fallback_clone", 0)),
+                    "infeas_accept_count": int(infeasible_acceptance.get(int(action_idx), {}).get("count", 0)),
+                    "infeas_accept_accepted": int(infeasible_acceptance.get(int(action_idx), {}).get("accepted", 0)),
+                    "infeas_accept_rejected": int(infeasible_acceptance.get(int(action_idx), {}).get("rejected", 0)),
+                    "infeas_accept_rate": float(infeasible_acceptance.get(int(action_idx), {}).get("accept_rate", 0.0)),
+                    "infeas_accept_avg_prob": float(infeasible_acceptance.get(int(action_idx), {}).get("avg_prob", 0.0)),
+                    "infeas_accept_avg_search_delta": float(infeasible_acceptance.get(int(action_idx), {}).get("avg_search_delta", 0.0)),
+                    "infeas_accept_avg_true_delta": float(infeasible_acceptance.get(int(action_idx), {}).get("avg_true_delta", 0.0)),
+                    "infeas_accept_avg_d_inf": float(infeasible_acceptance.get(int(action_idx), {}).get("avg_d_inf", 0.0)),
+                    "infeas_accept_avg_violation_sum": float(infeasible_acceptance.get(int(action_idx), {}).get("avg_violation_sum", 0.0)),
+                }
+            )
             rows.append(row)
         return rows
 
@@ -2020,8 +2300,11 @@ class ELP:
             solution.H,
             solution.F,
             solution.aspect_limits,
-            v_worst=self.worst_feasible_cost,
+            v_ref=self._current_true_cost_v_ref(),
             k_penalty=self.k_penalty,
+            tau=self.true_cost_tau,
+            alpha=self.true_cost_alpha,
+            beta=self.true_cost_beta,
             distance_metric="manhattan",
         )
         self._sync_solution_metrics(solution, metrics)
@@ -2031,12 +2314,23 @@ class ELP:
         if not getattr(solution, "current_is_feasible", False):
             return False
         cost = float(getattr(solution, "true_fitness", getattr(solution, "fitness", np.inf)))
+        feasible_mhc = float(getattr(solution, "MHC", cost))
         self.feasible_solution_count += 1
         self.recent_feasible_costs.append(cost)
         if self.worst_feasible_cost is None:
             self.worst_feasible_cost = cost
         else:
             self.worst_feasible_cost = max(float(self.worst_feasible_cost), cost)
+        current_v_ref = getattr(self, "current_v_ref", None)
+        if current_v_ref is None or not np.isfinite(current_v_ref) or float(current_v_ref) <= 0.0:
+            current_v_ref = self._current_true_cost_v_ref()
+        if current_v_ref is None or not np.isfinite(current_v_ref) or float(current_v_ref) <= 0.0:
+            self.current_v_ref = feasible_mhc
+        else:
+            self.current_v_ref = (
+                (1.0 - float(self.true_cost_ema_alpha)) * float(current_v_ref)
+                + float(self.true_cost_ema_alpha) * feasible_mhc
+            )
 
         improved = False
         if cost < self.best_feasible_cost:
@@ -2056,7 +2350,8 @@ class ELP:
             env_obj.best_feasible_cost = self.best_feasible_cost
             env_obj.worst_feasible_cost = self.worst_feasible_cost
             env_obj.best_fitness = self.best_feasible_cost
-            env_obj.current_v_worst = self.worst_feasible_cost
+            env_obj.current_v_ref = self.current_v_ref
+            env_obj.current_v_worst = self.current_v_ref
         self._observe_archive_candidate(solution)
         return improved
 
@@ -3011,7 +3306,9 @@ class ELP:
             return float(fallback)
 
         current_tilde = self._tilde_energy(base_solution.fitness)
-        local_v_worst = max(float(base_solution.fitness), 1.0)
+        local_v_ref = getattr(base_solution, "current_v_ref", None)
+        if local_v_ref is None or not np.isfinite(local_v_ref) or float(local_v_ref) <= 0.0:
+            local_v_ref = max(float(getattr(base_solution, "MHC", base_solution.fitness)), 1.0)
         deltas = []
 
         for _ in range(max(1, n_samples)):
@@ -3028,11 +3325,14 @@ class ELP:
                 candidate.H,
                 candidate.F,
                 candidate.aspect_limits,
-                v_worst=local_v_worst,
+                v_ref=local_v_ref,
                 k_penalty=self.k_penalty,
+                tau=self.true_cost_tau,
+                alpha=self.true_cost_alpha,
+                beta=self.true_cost_beta,
                 distance_metric="manhattan",
             )
-            candidate_cost = float(self._compute_search_cost(candidate, local_metrics))
+            candidate_cost = float(local_metrics.get("cost", np.inf))
             candidate_tilde = self._tilde_energy(candidate_cost)
             delta = candidate_tilde - current_tilde
             if np.isfinite(delta) and delta > 0:
@@ -4184,8 +4484,10 @@ class ELP:
         return self._standard46_select_best_candidate(solution, candidates)
 
     def _generate_new_guarded_cross_bay_relocate_light_candidate(self, solution, structure, flow):
+        self._record_light_action_diag(4, "calls")
         positions = self._standard46_facility_positions(structure)
         if not positions:
+            self._record_light_action_diag(4, "fallback_clone")
             return self._clone_evaluated_candidate(solution)
         context = self._standard46_light_proxy_context(solution, structure, flow)
         base_penalty = self._standard46_light_structure_penalty(context, structure)
@@ -4250,15 +4552,25 @@ class ELP:
                         context,
                         candidate_structure,
                     )
+                    self._record_light_action_diag(4, "generated_total")
+                    if int(candidate_d_inf_proxy) > 0:
+                        self._record_light_action_diag(4, "generated_infeasible_proxy")
                     geometry_worse = float(candidate_geometry_pressure - base_geometry_pressure)
                     d_inf_worse = int(candidate_d_inf_proxy - base_d_inf_proxy)
                     violation_worse = float(candidate_violation_proxy - base_violation_proxy)
-                    if base_is_feasible and candidate_d_inf_proxy > 0:
+                    if not self._standard46_allow_guarded_light_infeasible_candidate(
+                        context,
+                        base_is_feasible,
+                        candidate_d_inf_proxy,
+                        base_d_inf_proxy,
+                        candidate_violation_proxy,
+                        geometry_worse,
+                    ):
+                        self._record_light_action_diag(4, "guard_rejected")
                         continue
-                    if not base_is_feasible and d_inf_worse > 0:
-                        continue
-                    if base_is_feasible and geometry_worse > 1e-8:
-                        continue
+                    self._record_light_action_diag(4, "guard_passed_total")
+                    if int(candidate_d_inf_proxy) > 0:
+                        self._record_light_action_diag(4, "guard_passed_infeasible_proxy")
                     penalty_gain = float(base_penalty - candidate_penalty)
                     if (
                         candidate_penalty > base_penalty + 0.25
@@ -4287,11 +4599,27 @@ class ELP:
                         best_structure = candidate_structure
 
         if best_structure is None:
+            self._record_light_action_diag(4, "fallback_clone")
             return self._clone_evaluated_candidate(solution)
         candidates = []
         seen = set()
+        before_count = len(candidates)
         self._standard46_add_structure_candidate(solution, candidates, seen, best_structure)
-        return self._standard46_select_best_candidate(solution, candidates)
+        added_count = len(candidates) - before_count
+        if added_count > 0:
+            self._record_light_action_diag(4, "added_total", added_count)
+            added_candidate = candidates[-1]
+            if bool(getattr(added_candidate, "current_is_feasible", False)):
+                self._record_light_action_diag(4, "added_feasible")
+            else:
+                self._record_light_action_diag(4, "added_infeasible")
+        selected_candidate = self._standard46_select_best_candidate(solution, candidates)
+        self._record_light_action_diag(4, "best_total")
+        if bool(getattr(selected_candidate, "current_is_feasible", False)):
+            self._record_light_action_diag(4, "best_feasible")
+        else:
+            self._record_light_action_diag(4, "best_infeasible")
+        return selected_candidate
 
     def _generate_new_cross_bay_relocate_candidate(self, solution):
         structure = self._standard46_bay_structure(solution)
@@ -4399,7 +4727,9 @@ class ELP:
         return generated
 
     def _generate_new_boundary_shift_light_candidate(self, solution, structure, flow):
+        self._record_light_action_diag(5, "calls")
         if len(structure) < 2:
+            self._record_light_action_diag(5, "fallback_clone")
             return self._clone_evaluated_candidate(solution)
         context = self._standard46_light_proxy_context(solution, structure, flow)
         base_penalty = self._standard46_light_structure_penalty(context, structure)
@@ -4441,15 +4771,25 @@ class ELP:
                     context,
                     candidate_structure,
                 )
+                self._record_light_action_diag(5, "generated_total")
+                if int(candidate_d_inf_proxy) > 0:
+                    self._record_light_action_diag(5, "generated_infeasible_proxy")
                 geometry_worse = float(candidate_geometry_pressure - base_geometry_pressure)
                 d_inf_worse = int(candidate_d_inf_proxy - base_d_inf_proxy)
                 violation_worse = float(candidate_violation_proxy - base_violation_proxy)
-                if base_is_feasible and candidate_d_inf_proxy > 0:
+                if not self._standard46_allow_guarded_light_infeasible_candidate(
+                    context,
+                    base_is_feasible,
+                    candidate_d_inf_proxy,
+                    base_d_inf_proxy,
+                    candidate_violation_proxy,
+                    geometry_worse,
+                ):
+                    self._record_light_action_diag(5, "guard_rejected")
                     continue
-                if not base_is_feasible and d_inf_worse > 0:
-                    continue
-                if base_is_feasible and geometry_worse > 1e-8:
-                    continue
+                self._record_light_action_diag(5, "guard_passed_total")
+                if int(candidate_d_inf_proxy) > 0:
+                    self._record_light_action_diag(5, "guard_passed_infeasible_proxy")
                 candidate_cut = self._standard46_bay_pair_flow(flow, candidate_left, candidate_right)
                 cut_gain = float(current_cut - candidate_cut) / max(float(current_cut + candidate_cut), 1.0)
                 source_support = self._standard46_bay_pair_flow(flow, moved, source_remaining)
@@ -4479,11 +4819,27 @@ class ELP:
                     best_structure = candidate_structure
 
         if best_structure is None:
+            self._record_light_action_diag(5, "fallback_clone")
             return self._clone_evaluated_candidate(solution)
         candidates = []
         seen = set()
+        before_count = len(candidates)
         self._standard46_add_structure_candidate(solution, candidates, seen, best_structure)
-        return self._standard46_select_best_candidate(solution, candidates)
+        added_count = len(candidates) - before_count
+        if added_count > 0:
+            self._record_light_action_diag(5, "added_total", added_count)
+            added_candidate = candidates[-1]
+            if bool(getattr(added_candidate, "current_is_feasible", False)):
+                self._record_light_action_diag(5, "added_feasible")
+            else:
+                self._record_light_action_diag(5, "added_infeasible")
+        selected_candidate = self._standard46_select_best_candidate(solution, candidates)
+        self._record_light_action_diag(5, "best_total")
+        if bool(getattr(selected_candidate, "current_is_feasible", False)):
+            self._record_light_action_diag(5, "best_feasible")
+        else:
+            self._record_light_action_diag(5, "best_infeasible")
+        return selected_candidate
 
     def _generate_new_adjacent_boundary_block_repartition_candidate(self, solution):
         structure = self._standard46_bay_structure(solution)
@@ -7057,6 +7413,7 @@ class ELP:
             "violation_sum",
             "current_d_inf",
             "current_is_feasible",
+            "current_v_ref",
             "current_v_worst",
             "feasible_solution_count",
             "best_feasible_cost",

@@ -114,19 +114,19 @@ class GRASPBenchmarkEnv(gym.Env):
         np.random.shuffle(permutation)
         return FBSModel(permutation.tolist(), self._fixed_bay.copy().tolist(), genes=permutation.tolist())
 
-    def _normalize_permutation(self, permutation) -> np.ndarray:
-        values = np.asarray(permutation, dtype=int).reshape(-1).tolist()
-        expected = list(range(1, self.n + 1))
-        seen = set()
-        deduped = []
-        for value in values:
-            if 1 <= int(value) <= self.n and int(value) not in seen:
-                deduped.append(int(value))
-                seen.add(int(value))
-        for value in expected:
-            if value not in seen:
-                deduped.append(value)
-        return np.asarray(deduped[: self.n], dtype=int)
+    def _validate_permutation(self, permutation) -> np.ndarray:
+        values = np.asarray(permutation, dtype=int).reshape(-1)
+        if values.size != self.n:
+            raise ValueError(f"排列长度应为 {self.n}，实际为 {values.size}。")
+        invalid = sorted({int(value) for value in values.tolist() if int(value) < 1 or int(value) > self.n})
+        unique, counts = np.unique(values, return_counts=True)
+        duplicates = sorted(int(value) for value, count in zip(unique.tolist(), counts.tolist()) if int(count) > 1)
+        missing = sorted(set(range(1, self.n + 1)) - set(int(value) for value in values.tolist()))
+        if invalid or duplicates or missing:
+            raise ValueError(
+                f"检测到非法排列：非法编号={invalid}，重复设施={duplicates}，缺失设施={missing}"
+            )
+        return values.astype(int, copy=False)
 
     def _coords_from_permutation(self, permutation: np.ndarray):
         fac_x = np.zeros(self.n, dtype=float)
@@ -139,7 +139,7 @@ class GRASPBenchmarkEnv(gym.Env):
         return fac_x, fac_y
 
     def evaluate_fbs_model(self, fbs_model: FBSModel) -> Dict[str, Any]:
-        permutation = self._normalize_permutation(fbs_model.permutation)
+        permutation = self._validate_permutation(fbs_model.permutation)
         fac_x, fac_y = self._coords_from_permutation(permutation)
         distance_matrix = np.abs(fac_x[:, None] - fac_x[None, :]) + np.abs(fac_y[:, None] - fac_y[None, :])
         mhc = float(np.sum(np.triu(self.WMHC * distance_matrix, k=1)))
@@ -208,7 +208,7 @@ class GRASPBenchmarkEnv(gym.Env):
             fbs_model = options["fbs_model"]
         self._clear_runtime_tracking()
         self.fbs_model = copy.deepcopy(fbs_model) if fbs_model is not None else self._make_initial_model()
-        self.fbs_model.permutation = self._normalize_permutation(self.fbs_model.permutation).tolist()
+        self.fbs_model.permutation = self._validate_permutation(self.fbs_model.permutation).tolist()
         self.fbs_model.bay = self._fixed_bay.copy().tolist()
         self._evaluate_current_layout(snapshot_best=True)
         self.previous_fitness = self.fitness
@@ -293,7 +293,7 @@ class GRASPBenchmarkEnv(gym.Env):
         return np.asarray(new_perm[: self.n], dtype=int)
 
     def _apply_action(self, action_name: str):
-        permutation = self._normalize_permutation(self.fbs_model.permutation)
+        permutation = self._validate_permutation(self.fbs_model.permutation)
         if action_name == "facility_swap":
             new_perm = self._swap_two(permutation)
         elif action_name == "bay_flip":
@@ -331,7 +331,7 @@ class GRASPBenchmarkEnv(gym.Env):
         else:
             raise ValueError(f"Invalid action: {action_name}")
 
-        self.fbs_model.permutation = self._normalize_permutation(new_perm).tolist()
+        self.fbs_model.permutation = self._validate_permutation(new_perm).tolist()
         self.fbs_model.bay = self._fixed_bay.copy().tolist()
 
     def calculate_reward(self, previous_mhc, previous_cr):

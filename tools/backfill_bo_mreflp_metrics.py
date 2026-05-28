@@ -10,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.utils.BO_MREFLPBenchmark import BO_MREFLPBenchmark
+from src.utils.BO_MREFLPPaperExact import BO_MREFLPPaperExact
 
 DISPLAY_COLUMNS = {
     "archive_hypervolume": "HV",
@@ -51,6 +52,16 @@ def _load_points_from_row(row):
     return None
 
 
+def _resolve_archive_path(row):
+    archive_path = row.get("pareto_archive_path")
+    if not isinstance(archive_path, str) or not archive_path.strip():
+        return None
+    candidate_path = Path(archive_path)
+    if not candidate_path.is_absolute():
+        candidate_path = Path.cwd() / candidate_path
+    return candidate_path if candidate_path.exists() else None
+
+
 def _ensure_columns(frame):
     required_columns = [
         "HV",
@@ -65,6 +76,31 @@ def _ensure_columns(frame):
         "C(Ref, S)",
         "multiplicative ε",
         "benchmark_normalization_path",
+        "paper_exact_protocol",
+        "paper_exact_reference_mode",
+        "paper_exact_candidate_point_count",
+        "paper_exact_candidate_nd_size",
+        "paper_exact_reference_front_size",
+        "paper_exact_reference_source_point_count",
+        "paper_exact_reference_source_algorithms",
+        "paper_exact_hv",
+        "paper_exact_coverage",
+        "paper_exact_epsilon_additive",
+        "paper_exact_gd",
+        "paper_exact_igd",
+        "paper_exact_igd_plus",
+        "paper_exact_spread",
+        "paper_exact_ref_point",
+        "paper_exact_ideal",
+        "paper_exact_nadir",
+        "paper_exact_archive_path",
+        "paper_exact_all_legal",
+        "paper_exact_invalid_solution_count",
+        "paper_exact_all_objectives_match",
+        "paper_exact_objective_mismatch_count",
+        "paper_exact_legal_solution_count",
+        "paper_exact_archive_item_count",
+        "paper_exact_audit_report_path",
     ]
     for legacy_name, display_name in DISPLAY_COLUMNS.items():
         if legacy_name in frame.columns and display_name not in frame.columns:
@@ -80,6 +116,14 @@ def _ensure_columns(frame):
         "archive_hypervolume_mode",
         "archive_hypervolume_reference_point",
         "benchmark_normalization_path",
+        "paper_exact_protocol",
+        "paper_exact_reference_mode",
+        "paper_exact_reference_source_algorithms",
+        "paper_exact_ref_point",
+        "paper_exact_ideal",
+        "paper_exact_nadir",
+        "paper_exact_archive_path",
+        "paper_exact_audit_report_path",
     ]
     for column in object_columns:
         frame[column] = frame[column].astype(object)
@@ -94,6 +138,7 @@ def backfill(csv_path):
     for idx, row in frame.iterrows():
         instance_name = row.get("instance") or row.get("实例")
         points = _load_points_from_row(row)
+        archive_path = _resolve_archive_path(row)
         if not instance_name or points is None:
             continue
 
@@ -110,6 +155,14 @@ def backfill(csv_path):
         frame.at[idx, "C(Ref, S)"] = metrics["coverage_ref_to_s"]
         frame.at[idx, "multiplicative ε"] = metrics["epsilon_multiplicative"]
         frame.at[idx, "benchmark_normalization_path"] = metrics["normalization_path"]
+        if archive_path is not None:
+            paper_metrics = BO_MREFLPPaperExact.evaluate_archive(
+                instance_name=str(instance_name),
+                archive_path=archive_path,
+                save_report=True,
+            )
+            for key, value in paper_metrics.items():
+                frame.at[idx, key] = str(value) if isinstance(value, (list, dict)) else value
 
     frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
     return frame

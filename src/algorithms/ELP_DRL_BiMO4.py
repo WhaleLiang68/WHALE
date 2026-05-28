@@ -3,6 +3,7 @@ import datetime
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 import gym
@@ -86,15 +87,25 @@ class ELP(MO4ELP):
         if not np.any(weights > 0):
             weights = np.asarray([0.5, 0.5], dtype=float)
         weights = weights / np.sum(weights)
-        self.mo_base_weights = weights.copy()
-        self.mo_weights = weights.copy()
+        self.rl_context_dim = 0
         self.mo_adaptive_weights_enabled = self._parse_env_flag("ELP_BIMO_ADAPTIVE_WEIGHTS_ENABLE", True)
         self.mo_adaptive_weight_blend = float(
-            min(max(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_BLEND", 0.35), 0.0), 1.0)
+            min(max(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_BLEND", 0.15), 0.0), 1.0)
         )
-        self.mo_adaptive_weight_floor = float(max(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_FLOOR", 0.05), 1e-6))
+        legacy_floor = float(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_FLOOR", 0.20))
+        self.mo_adaptive_weight_min_component = float(
+            min(max(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_MIN_COMPONENT", legacy_floor), 1e-6), 0.49)
+        )
+        self.mo_adaptive_weight_floor = self.mo_adaptive_weight_min_component
+        self.mo_adaptive_weight_refresh_interval_steps = int(
+            max(1, _parse_env_int("ELP_BIMO_ADAPTIVE_WEIGHT_REFRESH_INTERVAL_STEPS", 250))
+        )
+        self.mo_adaptive_weight_deadband = float(max(_parse_env_float("ELP_BIMO_ADAPTIVE_WEIGHT_DEADBAND", 0.08), 0.0))
+        self.mo_base_weights = self._normalize_bi_weights(weights.copy(), floor_value=self.mo_adaptive_weight_min_component)
+        self.mo_weights = self.mo_base_weights.copy()
         self.mo_weight_update_count = 0
-        self.mo_last_weight_target = weights.copy()
+        self.mo_last_weight_target = self.mo_base_weights.copy()
+        self.mo_last_weight_update_step = -10**9
         self.mo_running_min = np.asarray([math.inf, math.inf], dtype=float)
         self.mo_running_max = np.asarray([-math.inf, -math.inf], dtype=float)
         super().__init__(
@@ -151,19 +162,23 @@ class ELP(MO4ELP):
         self.archive_update_count = 0
         self._reset_running_objective_bounds()
         base_weights = np.asarray(getattr(self, "mo_base_weights", [0.5, 0.5]), dtype=float)
-        self.mo_base_weights = self._normalize_bi_weights(base_weights, floor_value=0.05)
+        floor_value = float(getattr(self, "mo_adaptive_weight_min_component", 0.20) or 0.20)
+        self.mo_base_weights = self._normalize_bi_weights(base_weights, floor_value=floor_value)
         self.mo_weights = self.mo_base_weights.copy()
         self.mo_last_weight_target = self.mo_base_weights.copy()
         self.mo_weight_update_count = 0
+        self.mo_last_weight_update_step = -10**9
 
     def _reset_baseline_archive_state(self):
         super()._reset_baseline_archive_state()
         self._reset_running_objective_bounds()
         base_weights = np.asarray(getattr(self, "mo_base_weights", [0.5, 0.5]), dtype=float)
-        self.mo_base_weights = self._normalize_bi_weights(base_weights, floor_value=0.05)
+        floor_value = float(getattr(self, "mo_adaptive_weight_min_component", 0.20) or 0.20)
+        self.mo_base_weights = self._normalize_bi_weights(base_weights, floor_value=floor_value)
         self.mo_weights = self.mo_base_weights.copy()
         self.mo_last_weight_target = self.mo_base_weights.copy()
         self.mo_weight_update_count = 0
+        self.mo_last_weight_update_step = -10**9
 
     def _reset_running_objective_bounds(self):
         self.mo_running_min = np.asarray([math.inf, math.inf], dtype=float)
@@ -246,7 +261,7 @@ class ELP(MO4ELP):
         return solution_array
 
     @staticmethod
-    def _normalize_bi_weights(weights, floor_value=0.05):
+    def _normalize_bi_weights(weights, floor_value=0.20):
         vector = np.asarray(weights, dtype=float).reshape(-1)
         if vector.size < 2:
             vector = np.pad(vector, (0, 2 - vector.size), constant_values=0.5)
@@ -278,10 +293,10 @@ class ELP(MO4ELP):
         rows.sort(key=lambda item: item[0], reverse=True)
         sparse_vector = np.asarray(normalized[int(rows[0][1])], dtype=float)
         target = 1.0 - sparse_vector
-        target = np.maximum(target, float(getattr(self, "mo_adaptive_weight_floor", 0.05)))
+        target = np.maximum(target, float(getattr(self, "mo_adaptive_weight_min_component", 0.20)))
         return self._normalize_bi_weights(
             target,
-            floor_value=getattr(self, "mo_adaptive_weight_floor", 0.05),
+            floor_value=getattr(self, "mo_adaptive_weight_min_component", 0.20),
         )
 
     def _refresh_dynamic_weights(self):
@@ -290,15 +305,27 @@ class ELP(MO4ELP):
         if not bool(getattr(self, "mo_adaptive_weights_enabled", False)):
             self.mo_weights = self.mo_base_weights.copy()
             return self.mo_weights
+        current_step = int(max(getattr(self, "_trace_global_step", 0) or 0, 0))
+        last_update_step = int(getattr(self, "mo_last_weight_update_step", -10**9) or -10**9)
+        refresh_interval = int(max(1, int(getattr(self, "mo_adaptive_weight_refresh_interval_steps", 250) or 250)))
+        if int(getattr(self, "mo_weight_update_count", 0) or 0) > 0 and (current_step - last_update_step) < refresh_interval:
+            return self.mo_weights
         current = np.asarray(getattr(self, "mo_weights", self.mo_base_weights), dtype=float)
-        blend = float(getattr(self, "mo_adaptive_weight_blend", 0.35) or 0.35)
+        deadband = float(max(getattr(self, "mo_adaptive_weight_deadband", 0.08) or 0.08, 0.0))
+        if float(np.sum(np.abs(target - current))) < deadband:
+            return self.mo_weights
+        blend = float(getattr(self, "mo_adaptive_weight_blend", 0.15) or 0.15)
         updated = (1.0 - blend) * current + blend * target
         self.mo_weights = self._normalize_bi_weights(
             updated,
-            floor_value=getattr(self, "mo_adaptive_weight_floor", 0.05),
+            floor_value=getattr(self, "mo_adaptive_weight_min_component", 0.20),
         )
         self.mo_weight_update_count = int(getattr(self, "mo_weight_update_count", 0) or 0) + 1
+        self.mo_last_weight_update_step = current_step
         return self.mo_weights
+
+    def _agent_state_context(self, solution):
+        return None
 
     def _report_representative_snapshot(self):
         report_solution, report_score, report_index = MO_FBSUtil_BiMO4.select_knee_solution(
@@ -336,6 +363,8 @@ class ELP(MO4ELP):
         payload["objectiveWeights"] = np.asarray(self.mo_weights, dtype=float).tolist()
         payload["baseObjectiveWeights"] = np.asarray(self.mo_base_weights, dtype=float).tolist()
         payload["adaptiveWeightTarget"] = np.asarray(self.mo_last_weight_target, dtype=float).tolist()
+        payload["dqnContextMode"] = "disabled"
+        payload["dqnContextDim"] = int(getattr(self, "rl_context_dim", 0) or 0)
         archive_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _patch_run_summary_with_report_representative(self, report_snapshot):
@@ -363,6 +392,8 @@ class ELP(MO4ELP):
         payload["adaptiveWeightsEnabled"] = bool(self.mo_adaptive_weights_enabled)
         payload["adaptiveWeightBlend"] = self._safe_float(self.mo_adaptive_weight_blend)
         payload["adaptiveWeightUpdates"] = int(self.mo_weight_update_count)
+        payload["dqnContextMode"] = "disabled"
+        payload["dqnContextDim"] = int(getattr(self, "rl_context_dim", 0) or 0)
         run_summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _patch_summary_csv_with_report_representative(self, report_snapshot):
@@ -388,6 +419,8 @@ class ELP(MO4ELP):
             "objectiveWeights",
             "baseObjectiveWeights",
             "adaptiveWeightTarget",
+            "dqnContextMode",
+            "dqnContextDim",
         ):
             if column not in frame.columns:
                 frame[column] = pd.NA
@@ -415,6 +448,8 @@ class ELP(MO4ELP):
         frame.loc[row_mask, "objectiveWeights"] = json.dumps(np.asarray(self.mo_weights, dtype=float).tolist(), ensure_ascii=False)
         frame.loc[row_mask, "baseObjectiveWeights"] = json.dumps(np.asarray(self.mo_base_weights, dtype=float).tolist(), ensure_ascii=False)
         frame.loc[row_mask, "adaptiveWeightTarget"] = json.dumps(np.asarray(self.mo_last_weight_target, dtype=float).tolist(), ensure_ascii=False)
+        frame.loc[row_mask, "dqnContextMode"] = "disabled"
+        frame.loc[row_mask, "dqnContextDim"] = int(getattr(self, "rl_context_dim", 0) or 0)
         frame.to_csv(summary_csv_path, index=False, encoding="utf-8-sig")
 
     def _apply_report_representative_reporting(self):
@@ -450,6 +485,8 @@ class ELP(MO4ELP):
             self.mo_run_summary["adaptiveWeightsEnabled"] = bool(self.mo_adaptive_weights_enabled)
             self.mo_run_summary["adaptiveWeightBlend"] = self._safe_float(self.mo_adaptive_weight_blend)
             self.mo_run_summary["adaptiveWeightUpdates"] = int(self.mo_weight_update_count)
+            self.mo_run_summary["dqnContextMode"] = "disabled"
+            self.mo_run_summary["dqnContextDim"] = int(getattr(self, "rl_context_dim", 0) or 0)
         if isinstance(self.last_run_payload, dict):
             self.last_run_payload["search_representative_archive_index"] = (
                 None if self.representative_archive_index is None else int(self.representative_archive_index)
@@ -476,6 +513,8 @@ class ELP(MO4ELP):
             self.last_run_payload["adaptive_weight_target"] = np.asarray(self.mo_last_weight_target, dtype=float).tolist()
             self.last_run_payload["adaptive_weights_enabled"] = bool(self.mo_adaptive_weights_enabled)
             self.last_run_payload["adaptive_weight_updates"] = int(self.mo_weight_update_count)
+            self.last_run_payload["dqn_context_mode"] = "disabled"
+            self.last_run_payload["dqn_context_dim"] = int(getattr(self, "rl_context_dim", 0) or 0)
         self._patch_archive_json_with_report_representative(report_snapshot)
         self._patch_run_summary_with_report_representative(report_snapshot)
         self._patch_summary_csv_with_report_representative(report_snapshot)
@@ -901,6 +940,7 @@ class ELP(MO4ELP):
             generations = int(max(1, generations))
             sequence_length = int(max(1, sequence_length if sequence_length is not None else self.t_max))
             run_seed = None if seed is None else int(seed)
+            wall_time_limit_seconds = float(max(getattr(self, "wall_time_limit_seconds", 0.0) or 0.0, 0.0))
 
             self._reset_baseline_archive_state()
             start_time = datetime.datetime.now()
@@ -952,13 +992,43 @@ class ELP(MO4ELP):
                 )
                 effective_population = int(len(ref_dirs))
 
+            termination = get_termination("n_gen", generations)
+            termination_mode = "n_gen"
+            if wall_time_limit_seconds > 0.0:
+                from pymoo.core.termination import TerminateIfAny
+
+                termination = TerminateIfAny(
+                    get_termination("n_gen", generations),
+                    get_termination("time", wall_time_limit_seconds),
+                )
+                termination_mode = "n_gen_or_time"
+
+            optimize_start = time.perf_counter()
             result = minimize(
                 problem,
                 algorithm,
-                termination=get_termination("n_gen", generations),
+                termination=termination,
                 seed=run_seed,
                 save_history=False,
                 verbose=False,
+            )
+            optimize_runtime_seconds = float(max(time.perf_counter() - optimize_start, 0.0))
+            actual_generations = int(
+                max(
+                    1,
+                    int(
+                        getattr(
+                            getattr(result, "algorithm", None),
+                            "n_gen",
+                            getattr(algorithm, "n_gen", generations),
+                        )
+                        or generations
+                    ),
+                )
+            )
+            wall_time_terminated = bool(
+                wall_time_limit_seconds > 0.0
+                and optimize_runtime_seconds + 1e-9 >= max(wall_time_limit_seconds - 1.0, wall_time_limit_seconds * 0.98)
             )
 
             best_observed = self.best_feasible_cost
@@ -971,7 +1041,7 @@ class ELP(MO4ELP):
 
             self._refresh_archive_state()
             end_time = datetime.datetime.now()
-            iteration_count = int(effective_population * generations)
+            iteration_count = int(effective_population * actual_generations)
 
             best_solution = self.best_feasible_solution if self.best_feasible_solution is not None else self._light_clone_solution(base_solution)
             if self.representative_solution is not None:
@@ -1008,11 +1078,16 @@ class ELP(MO4ELP):
                 "mo_events_path": None,
                 "mo_action_stats_path": None,
                 "mo_run_summary_path": None,
+                "wall_time_terminated": bool(wall_time_terminated),
+                "wall_time_limit_seconds": self._safe_float(wall_time_limit_seconds),
+                "runtime_seconds": self._safe_float(optimize_runtime_seconds),
                 "baseline_algorithm": algo_key.upper(),
                 "baseline_population": int(effective_population),
-                "baseline_generations": int(generations),
+                "baseline_generations": int(actual_generations),
+                "baseline_generations_requested": int(generations),
                 "baseline_sequence_length": int(sequence_length),
                 "baseline_seed": run_seed,
+                "baseline_termination_mode": termination_mode,
             }
             return iteration_count, is_valid, best_solution, best_energy, start_time, end_time, fast_time
         finally:

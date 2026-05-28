@@ -29,9 +29,9 @@ class DQNTransitionEngine:
         update_epsilon_schedule = getattr(agent, "update_epsilon_schedule", None)
         if callable(update_epsilon_schedule):
             update_epsilon_schedule(runtime.current_global_step)
-        record_action_mode_visit = getattr(runtime, "_record_action_mode_visit", None)
-        if callable(record_action_mode_visit):
-            record_action_mode_visit(runtime.s)
+        record_selection_action_mode = getattr(runtime, "_record_selection_action_mode", None)
+        if callable(record_selection_action_mode):
+            record_selection_action_mode(runtime.s)
 
         current_state_idx = runtime.state_encoder(runtime.s)
         allowed_actions = runtime._get_allowed_action_indices(runtime.s)
@@ -44,6 +44,12 @@ class DQNTransitionEngine:
         previous_best_feasible = runtime.best_feasible_cost
 
         candidate = runtime.generate_candidate_by_action(runtime.s, real_action_idx)
+        candidate_is_infeasible = (
+            int(real_action_idx) in {4, 5}
+            and not bool(getattr(candidate, "current_is_feasible", False))
+        )
+        current_true_cost = float(getattr(runtime.s, "true_fitness", previous_cost))
+        candidate_true_cost = float(getattr(candidate, "true_fitness", getattr(candidate, "fitness", np.inf)))
         runtime._record_action_selection(
             real_action_idx,
             previous_cost,
@@ -54,6 +60,20 @@ class DQNTransitionEngine:
             allowed_count=action_info.get("allowed_count"),
         )
         accept, prob, _, _ = runtime._accept_candidate(runtime.s.fitness, candidate.fitness)
+        if candidate_is_infeasible:
+            record_infeasible_acceptance_diag = getattr(runtime, "_record_infeasible_acceptance_diag", None)
+            if callable(record_infeasible_acceptance_diag):
+                record_infeasible_acceptance_diag(
+                    real_action_idx,
+                    accept,
+                    prob,
+                    runtime.s.fitness,
+                    candidate.fitness,
+                    current_true_cost,
+                    candidate_true_cost,
+                    int(getattr(candidate, "current_d_inf", 0)),
+                    float(getattr(candidate, "violation_sum", 0.0)),
+                )
         runtime.prob_history.append(prob)
         runtime._record_acceptance(accept)
 
@@ -130,6 +150,9 @@ class DQNTransitionEngine:
         rl_next_state_idx = runtime.state_encoder(runtime.s)
         rl_next_d_inf = runtime.s.current_d_inf
         rl_next_cost = runtime.s.fitness
+        record_post_action_mode = getattr(runtime, "_record_post_action_mode", None)
+        if callable(record_post_action_mode):
+            record_post_action_mode(runtime.s)
         rl_allowed_next_actions = runtime._get_allowed_action_indices(runtime.s)
         step_improved = bool(
             (
@@ -330,8 +353,11 @@ class DQNProgramRunner:
             env_obj.H,
             env_obj.F,
             env_obj.aspect_limits,
-            v_worst=getattr(env_obj, "current_v_worst", None),
-            k_penalty=getattr(env_obj, "k_penalty", 1),
+            v_ref=getattr(env_obj, "current_v_ref", getattr(env_obj, "current_v_worst", None)),
+            k_penalty=getattr(env_obj, "k_penalty", 1.0),
+            tau=getattr(env_obj, "true_cost_tau", 0.2),
+            alpha=getattr(env_obj, "true_cost_alpha", 1.0),
+            beta=getattr(env_obj, "true_cost_beta", 5.0),
             distance_metric=getattr(env_obj, "distance_metric", "manhattan"),
         )
         fitness = float(metrics["cost"])

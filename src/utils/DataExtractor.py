@@ -14,6 +14,7 @@ from matplotlib import pyplot as plt
 import src.utils.FBSUtil as FBSUtil
 import src.utils.config as config
 from src.utils.FBSModel import FBSModel
+from src.utils.FlowMatrixUtil import FlowMatrixUtil
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
@@ -103,14 +104,12 @@ class DataProcessingEnv(gym.Env):
             raise ValueError(f"Instance '{instance}' not found. Valid instances: {valid_instances}")
 
         self.uuid = uuid.uuid4()
-        raw_F = np.asarray(self.FlowMatrices[self.instance])
+        raw_F = FlowMatrixUtil.get_raw_flow_matrix(self.FlowMatrices, self.instance)
         # Du62 保持原始物流量矩阵，不做对称补全。
         if self.instance == "Du62":
             self.F = raw_F.copy()
-        elif np.allclose(np.tril(raw_F, -1), 0):
-            self.F = raw_F + raw_F.T - np.diag(np.diag(raw_F))
         else:
-            self.F = raw_F.copy()
+            self.F = FlowMatrixUtil.symmetrize_if_upper_triangular(raw_F)
         self.n = self.problems[self.instance]
         # self.areas, self.aspect_limits = FBSUtil.getAreaData(self.sizes[self.instance])
         # self.fac_limit_aspect = FBSUtil.get_instance_aspect_limit(self.aspect_limits)
@@ -229,7 +228,7 @@ class DataProcessingEnv(gym.Env):
         self.fitness = metrics["cost"]
         self.current_d_inf = metrics["d_inf"]
         self.current_is_feasible = metrics["is_feasible"]
-        self.current_v_worst = metrics["v_worst"]
+        self.current_v_worst = metrics.get("v_ref", metrics.get("v_worst"))
 
     def _evaluate_current_layout(self, snapshot_best: bool = True) -> Dict[str, Any]:
         metrics = FBSUtil.evaluate_layout(

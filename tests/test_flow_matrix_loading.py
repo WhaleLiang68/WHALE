@@ -56,6 +56,28 @@ class FlowMatrixLoadingTests(unittest.TestCase):
         env = self._build_env(raw)
         np.testing.assert_array_equal(env.F, raw)
 
+    def test_ab20_variants_are_forced_to_use_paper_csv_matrix(self):
+        raw = np.zeros((20, 20), dtype=float)
+        payload = (
+            {"AB20-ar50": 20},
+            {"AB20-ar50": raw},
+            {"AB20-ar50": object()},
+            {"AB20-ar50": 10.0},
+            {"AB20-ar50": 20.0},
+        )
+        expected = np.full((20, 20), 7.0, dtype=float)
+        with patch("builtins.open", mock_open(read_data=b"mock")), \
+             patch("src.utils.DataExtractor.pickle.load", return_value=payload), \
+             patch(
+                 "src.utils.DataExtractor.FBSUtil.getAreaData",
+                 return_value=(np.ones(20), np.ones(20)),
+             ), \
+             patch("src.utils.DataExtractor.FBSUtil.get_instance_aspect_limit", return_value=1.0), \
+             patch("src.utils.DataExtractor.FlowMatrixUtil.load_ab20_1963_matrix", return_value=(expected, None)):
+            env = DataProcessingEnv(instance="AB20-ar50")
+
+        np.testing.assert_array_equal(env.F, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

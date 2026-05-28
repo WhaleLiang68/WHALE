@@ -1,9 +1,8 @@
 import copy
-from pathlib import Path
 
 import numpy as np
 
-import src.utils.config as config
+from src.utils.FlowMatrixUtil import FlowMatrixUtil
 
 
 class MO_PaperInstanceProfileUtil:
@@ -12,7 +11,6 @@ class MO_PaperInstanceProfileUtil:
     FLOW_PROFILE_VERSION = "paper_flow_profile_v1"
     CONSTRAINT_PROFILE_VERSION = "paper_constraint_profile_v1"
     _RAW_FLOW_INSTANCES = {"O7", "O9"}
-    _AB20_1963_CSV = "AB20(1963).csv"
     _SC_CONSTRAINT_NOTES = {
         "SC30": "论文正文未单列 SC30 的 AR 数值；当前论文线按常用基准口径使用最大长宽比上限 5.0。",
         "SC35": "论文正文未单列 SC35 的 AR 数值；当前论文线按常用基准口径使用最大长宽比上限 4.0。",
@@ -22,19 +20,9 @@ class MO_PaperInstanceProfileUtil:
     def _base_env(env):
         return env.unwrapped if hasattr(env, "unwrapped") else env
 
-    @staticmethod
-    def _data_dir():
-        return Path(config.FILE_PATH).resolve().parent
-
     @classmethod
     def _load_ab20_1963_matrix(cls):
-        csv_path = cls._data_dir() / cls._AB20_1963_CSV
-        # 文件带 UTF-8 BOM，显式声明编码，避免 Windows 按系统编码误读。
-        with csv_path.open("r", encoding="utf-8-sig") as handle:
-            matrix = np.loadtxt(handle, delimiter=",", dtype=float)
-        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
-            raise ValueError(f"AB20 论文流量矩阵必须为方阵，当前形状为 {matrix.shape}")
-        return matrix, csv_path
+        return FlowMatrixUtil.load_ab20_1963_matrix()
 
     @classmethod
     def build_metadata(cls, env):
@@ -66,7 +54,7 @@ class MO_PaperInstanceProfileUtil:
                     "paperFlowSource": "raw_pickle_matrix",
                 }
             )
-        elif instance == "AB20-ar3":
+        elif FlowMatrixUtil.uses_ab20_paper_flow(instance):
             paper_flow, csv_path = cls._load_ab20_1963_matrix()
             expected_shape = np.asarray(base_env.F).shape
             if paper_flow.shape != expected_shape:

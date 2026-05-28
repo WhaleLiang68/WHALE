@@ -1902,6 +1902,9 @@ class ELP(StandardELP):
             state = state * 4 + band
         return state
 
+    def _agent_state_context(self, solution):
+        return None
+
     def _nondominated_acceptance_cap(self):
         progress_ratio = min(max(float(getattr(self, "current_progress_ratio", 0.0) or 0.0), 0.0), 1.0)
         temperature_ratio = min(
@@ -2817,6 +2820,7 @@ class ELP(StandardELP):
                 idqn_k=2,
                 embedding_dim=32,
                 hidden_dim=64,
+                context_dim=int(max(0, int(getattr(self, "rl_context_dim", 0) or 0))),
                 grad_clip=10.0,
             )
         if not self._bootstrap_until_first_feasible():
@@ -2861,8 +2865,16 @@ class ELP(StandardELP):
                 self._trace_step_index = step_idx
                 self.current_progress_ratio = float(global_step) / float(max(1, total_steps))
                 current_state_idx = self.state_encoder(self.s)
+                current_state_context = self._agent_state_context(self.s)
                 allowed_actions = self._get_allowed_action_indices(self.s)
-                action_table_idx = agent.select_action(current_state_idx, allowed_actions=allowed_actions)
+                if isinstance(agent, StandardDQNAgent):
+                    action_table_idx = agent.select_action(
+                        current_state_idx,
+                        allowed_actions=allowed_actions,
+                        context_features=current_state_context,
+                    )
+                else:
+                    action_table_idx = agent.select_action(current_state_idx, allowed_actions=allowed_actions)
                 real_action_idx = self.valid_actions[action_table_idx]
                 previous_cost = self.s.fitness
                 previous_d_inf = self.s.current_d_inf
@@ -2966,6 +2978,7 @@ class ELP(StandardELP):
                     )
 
                 next_state_idx = self.state_encoder(self.s)
+                next_state_context = self._agent_state_context(self.s)
                 allowed_next_actions = self._get_allowed_action_indices(self.s)
                 reward = self._compute_transition_reward(
                     previous_cost,
@@ -2976,14 +2989,26 @@ class ELP(StandardELP):
                     accept,
                 )
                 done_flag = step_idx == self.t_max - 1
-                loss_value = agent.update_Q(
-                    current_state_idx,
-                    action_table_idx,
-                    reward,
-                    next_state_idx,
-                    done=done_flag,
-                    allowed_next_actions=allowed_next_actions,
-                )
+                if isinstance(agent, StandardDQNAgent):
+                    loss_value = agent.update_Q(
+                        current_state_idx,
+                        action_table_idx,
+                        reward,
+                        next_state_idx,
+                        done=done_flag,
+                        allowed_next_actions=allowed_next_actions,
+                        state_context=current_state_context,
+                        next_state_context=next_state_context,
+                    )
+                else:
+                    loss_value = agent.update_Q(
+                        current_state_idx,
+                        action_table_idx,
+                        reward,
+                        next_state_idx,
+                        done=done_flag,
+                        allowed_next_actions=allowed_next_actions,
+                    )
                 self._last_loss_value = loss_value
                 self._update_transition_counters(accept, prob, reward, loss_value)
                 self.modified_energy_history.append(self._tilde_energy(self.s.fitness))

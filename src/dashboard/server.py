@@ -17,6 +17,7 @@ import numpy as np
 
 from src.utils import FBSUtil
 from src.utils.FBSModel import FBSModel
+from src.utils.FlowMatrixUtil import FlowMatrixUtil
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -204,13 +205,6 @@ def normalize_instance_key(instance_name, problems):
     raise KeyError(f"未在实例数据中找到实例: {candidate}")
 
 
-def symmetrize_flow_matrix(raw_flow):
-    matrix = np.asarray(raw_flow, dtype=float)
-    if np.allclose(np.tril(matrix, -1), 0):
-        return matrix + matrix.T - np.diag(np.diag(matrix))
-    return matrix.copy()
-
-
 def scale_to_255(values):
     values = np.asarray(values, dtype=float).reshape(-1)
     if values.size == 0:
@@ -356,7 +350,11 @@ def build_layout_payload_from_solution(instance_name: str, solution_text: str):
 
     fbs_model = FBSModel(permutation=permutation, bay=bay)
     areas, aspect_limits = FBSUtil.getAreaData(instance_bundle["sizes"][instance_key])
-    flow_matrix = symmetrize_flow_matrix(instance_bundle["flow_matrices"][instance_key])
+    raw_flow_matrix = FlowMatrixUtil.get_raw_flow_matrix(
+        instance_bundle["flow_matrices"],
+        instance_key,
+    )
+    flow_matrix = FlowMatrixUtil.symmetrize_if_upper_triangular(raw_flow_matrix)
     layout_height = float(instance_bundle["layout_widths"][instance_key])
     layout_width = float(instance_bundle["layout_lengths"][instance_key])
 
