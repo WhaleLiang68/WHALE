@@ -41,3 +41,7 @@ Thumbs.db
 # Project experiment outputs
 files/expresults/
 run_time_per_experiment_bar.png
+
+# Local datasets and generated matrices
+data/
+src/utils/data/
