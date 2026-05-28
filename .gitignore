@@ -41,6 +41,15 @@ Thumbs.db
 # Project experiment outputs
 files/expresults/
 run_time_per_experiment_bar.png
+files/telemetry/
+files/profiling/
+files/elp_param_sweeps/
+files/plots/
+src/algorithms/files/plots/
+benchmark/
+tmp/
+docs/*.pdf
+docs/*.docx
 
 # Local datasets and generated matrices
 data/
