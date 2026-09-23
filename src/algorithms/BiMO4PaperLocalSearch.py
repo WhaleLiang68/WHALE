@@ -83,12 +83,39 @@ class BiMO4PaperLocalSearch:
         improved = True
         while improved and self._can_continue():
             improved = False
-            for outer_idx in np.random.permutation(n):
-                found_better = False
-                for inner_idx in np.random.permutation(n):
-                    if int(outer_idx) >= int(inner_idx):
-                        continue
-                    candidate = self._apply_interchange(current, positions[int(outer_idx)], positions[int(inner_idx)])
+            
+            if not getattr(self.solver, "ablation_local_search_opt", True):
+                # Baseline path (unoptimized nested loops)
+                for idx1 in np.random.permutation(n):
+                    if improved or not self._can_continue():
+                        break
+                    for idx2 in np.random.permutation(n):
+                        if idx1 == idx2:
+                            continue
+                        candidate = self._apply_interchange(current, positions[idx1], positions[idx2])
+                        if candidate is None:
+                            return current
+                        if not bool(getattr(candidate, "current_is_feasible", False)):
+                            continue
+
+                        comparison = MO_FBSUtil_BiMO4.compare_solution_quality(candidate, current)
+                        if comparison < 0:
+                            self._observe_candidate(candidate)
+                            current = candidate
+                            positions = self._enumerate_positions(current)
+                            n = len(positions)
+                            improved = True
+                            self.accepted_moves += 1
+                            break
+                        if comparison == 0:
+                            self._observe_candidate(candidate)
+            else:
+                # Optimized path (flat unique shuffled pairs)
+                pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+                np.random.shuffle(pairs)
+                
+                for idx1, idx2 in pairs:
+                    candidate = self._apply_interchange(current, positions[idx1], positions[idx2])
                     if candidate is None:
                         return current
                     if not bool(getattr(candidate, "current_is_feasible", False)):
@@ -101,13 +128,10 @@ class BiMO4PaperLocalSearch:
                         positions = self._enumerate_positions(current)
                         n = len(positions)
                         improved = True
-                        found_better = True
                         self.accepted_moves += 1
                         break
                     if comparison == 0:
                         self._observe_candidate(candidate)
-                if found_better or not self._can_continue():
-                    break
         return current
 
     def _aols_step(self, solution, factor):
@@ -123,12 +147,46 @@ class BiMO4PaperLocalSearch:
         improved = True
         while improved and self._can_continue():
             improved = False
-            for outer_idx in np.random.permutation(n):
-                found_better = False
-                for inner_idx in np.random.permutation(n):
-                    if int(outer_idx) >= int(inner_idx):
-                        continue
-                    candidate = self._apply_interchange(current, positions[int(outer_idx)], positions[int(inner_idx)])
+            
+            if not getattr(self.solver, "ablation_local_search_opt", True):
+                # Baseline path (unoptimized nested loops)
+                for idx1 in np.random.permutation(n):
+                    if improved or not self._can_continue():
+                        break
+                    for idx2 in np.random.permutation(n):
+                        if idx1 == idx2:
+                            continue
+                        candidate = self._apply_interchange(current, positions[idx1], positions[idx2])
+                        if candidate is None:
+                            return current
+                        if not bool(getattr(candidate, "current_is_feasible", False)):
+                            continue
+
+                        if factor == "mhc":
+                            accepts = float(getattr(candidate, "MHC", math.inf)) + 1e-12 < float(
+                                getattr(current, "MHC", math.inf)
+                            )
+                        else:
+                            accepts = float(getattr(candidate, "CR", 0.0)) > float(getattr(current, "CR", 0.0)) + 1e-12
+
+                        if accepts:
+                            self._observe_candidate(candidate)
+                            current = candidate
+                            positions = self._enumerate_positions(current)
+                            n = len(positions)
+                            improved = True
+                            self.accepted_moves += 1
+                            break
+
+                        if MO_FBSUtil_BiMO4.compare_solution_quality(candidate, current) == 0:
+                            self._observe_candidate(candidate)
+            else:
+                # Optimized path (flat unique shuffled pairs)
+                pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+                np.random.shuffle(pairs)
+
+                for idx1, idx2 in pairs:
+                    candidate = self._apply_interchange(current, positions[idx1], positions[idx2])
                     if candidate is None:
                         return current
                     if not bool(getattr(candidate, "current_is_feasible", False)):
@@ -147,14 +205,11 @@ class BiMO4PaperLocalSearch:
                         positions = self._enumerate_positions(current)
                         n = len(positions)
                         improved = True
-                        found_better = True
                         self.accepted_moves += 1
                         break
 
                     if MO_FBSUtil_BiMO4.compare_solution_quality(candidate, current) == 0:
                         self._observe_candidate(candidate)
-                if found_better or not self._can_continue():
-                    break
         return current
 
     def local_search(self, solution):

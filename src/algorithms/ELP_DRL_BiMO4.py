@@ -118,6 +118,10 @@ class ELP(MO4ELP):
         self.bimo_archive_bootstrap_attempt_factor = int(
             max(1, _parse_env_int("ELP_BIMO_ARCHIVE_BOOTSTRAP_ATTEMPT_FACTOR", 8))
         )
+        self.bimo_objective_bootstrap_enabled = _parse_env_flag("ELP_BIMO_OBJECTIVE_BOOTSTRAP_ENABLE", True)
+        self.bimo_objective_bootstrap_cr_fraction = float(
+            min(max(_parse_env_float("ELP_BIMO_OBJECTIVE_BOOTSTRAP_CR_FRACTION", 0.30), 0.0), 1.0)
+        )
         self.bimo_archive_paperls_enabled = _parse_env_flag("ELP_BIMO_ARCHIVE_PAPERLS_ENABLE", False)
         self.bimo_archive_paperls_anchor_count = int(
             max(1, _parse_env_int("ELP_BIMO_ARCHIVE_PAPERLS_ANCHORS", 8))
@@ -1726,7 +1730,7 @@ class ELP(MO4ELP):
                 unknown_count += 1
         return archive_count, pool_count, unknown_count
 
-    def _bimo_quality_gated_paperls_pool_candidates(self, archive_candidates):
+    def _bimo_archive_changing_paperls_pool_candidates(self, archive_candidates):
         """仅允许能改变当前 Pareto 档案的候选池解参与最终 PaperLS。"""
         archive_keys = {
             self._bimo_solution_key(candidate)
@@ -1776,7 +1780,7 @@ class ELP(MO4ELP):
                 return anchors[:anchor_limit]
 
         # 3) 只有能改变当前档案的候选池解才补位。
-        for candidate in self._bimo_quality_gated_paperls_pool_candidates(archive_candidates):
+        for candidate in self._bimo_archive_changing_paperls_pool_candidates(archive_candidates):
             self._append_unique_bimo_archive_paperls_anchor(anchors, seen, candidate)
             if len(anchors) >= anchor_limit:
                 return anchors[:anchor_limit]
@@ -1794,7 +1798,7 @@ class ELP(MO4ELP):
             "anchorsFromArchive": 0,
             "anchorsFromCandidatePool": 0,
             "anchorsFromUnknown": 0,
-            "anchorPolicy": "archive_first_quality_gated_pool",
+            "anchorPolicy": "archive_first_archive_changing_pool",
             "archiveSizeBefore": int(len(getattr(self, "pareto_archive", []) or [])),
             "archiveSizeAfter": int(len(getattr(self, "pareto_archive", []) or [])),
             "candidatePoolSizeBefore": self._bimo_candidate_pool_size(),
@@ -3087,6 +3091,101 @@ class ELP(MO4ELP):
             return False
         return bool(self._observe_feasible_state(candidate))
 
+    @staticmethod
+    def _bimo_objective_value(candidate, objective_idx, default=math.inf):
+        objectives = getattr(candidate, "mo_objectives_min", None)
+        if objectives is None:
+            return float(default)
+        vector = np.asarray(objectives, dtype=float).reshape(-1)
+        if vector.size <= int(objective_idx) or not np.isfinite(vector[int(objective_idx)]):
+            return float(default)
+        return float(vector[int(objective_idx)])
+
+    def _bimo_bootstrap_mode_cycle(self):
+        base_cycle = ["cr", "mhc", "balanced", "cr", "sparse", "balanced", "mhc", "cr", "balanced", "restart"]
+        desired_cr_count = int(round(len(base_cycle) * float(
+            getattr(self, "bimo_objective_bootstrap_cr_fraction", 0.30) or 0.0
+        )))
+        desired_cr_count = int(min(max(desired_cr_count, 0), len(base_cycle)))
+        current_cr_count = base_cycle.count("cr")
+        if desired_cr_count < current_cr_count:
+            replace_count = current_cr_count - desired_cr_count
+            for idx in range(len(base_cycle) - 1, -1, -1):
+                if replace_count <= 0:
+                    break
+                if base_cycle[idx] == "cr":
+                    base_cycle[idx] = "balanced"
+                    replace_count -= 1
+        elif desired_cr_count > current_cr_count:
+            replace_count = desired_cr_count - current_cr_count
+            for idx in range(len(base_cycle) - 1, -1, -1):
+                if replace_count <= 0:
+                    break
+                if base_cycle[idx] != "cr":
+                    base_cycle[idx] = "cr"
+                    replace_count -= 1
+        return tuple(base_cycle)
+
+    def _select_bimo_bootstrap_base(self, mode, best_candidate):
+        candidates = self._bimo_anchor_candidate_pool(include_archive=True, include_candidate_pool=True)
+        if not candidates:
+            return best_candidate
+
+        if mode == "cr":
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    self._bimo_objective_value(item, 1, math.inf),
+                    -float(getattr(item, "CR", 0.0) or 0.0),
+                    self._bimo_candidate_score(item),
+                ),
+            )
+        elif mode == "mhc":
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    self._bimo_objective_value(item, 0, math.inf),
+                    float(getattr(item, "MHC", math.inf)),
+                    self._bimo_candidate_score(item),
+                ),
+            )
+        elif mode == "sparse":
+            ordered = self._bimo_sparse_anchor_candidates(candidates, len(candidates))
+        else:
+            ordered = self._bimo_ranked_anchor_candidates(candidates)
+
+        if not ordered:
+            return best_candidate
+        top_count = int(max(1, min(len(ordered), math.ceil(math.sqrt(len(ordered))))))
+        return ordered[int(np.random.randint(0, top_count))]
+
+    def _generate_bimo_recipe_bootstrap_candidate(self, base, recipes, attempts):
+        recipe = recipes[(int(attempts) - 1) % len(recipes)] if recipes else []
+        return self._generate_candidate_by_recipe(base, recipe), "recipe"
+
+    def _generate_bimo_objective_bootstrap_candidate(self, best_candidate, recipes, attempts):
+        mode_cycle = self._bimo_bootstrap_mode_cycle()
+        mode = mode_cycle[(int(attempts) - 1) % len(mode_cycle)] if mode_cycle else "balanced"
+        base = self._select_bimo_bootstrap_base(mode, best_candidate)
+
+        if mode == "restart":
+            candidate = copy.deepcopy(self.env)
+            candidate.reset()
+            self._evaluate_solution(candidate)
+            return candidate, "restart"
+
+        if (
+            mode == "cr"
+            and bool(getattr(self, "bimo_cr_boundary_repartition_enabled", True))
+        ):
+            candidate = self._generate_bimo_cr_boundary_repartition_candidate(base)
+            same_as_base = self._bimo_solution_key(candidate) == self._bimo_solution_key(base)
+            if bool(getattr(candidate, "current_is_feasible", False)) and not same_as_base:
+                return candidate, "cr"
+
+        candidate, _source = self._generate_bimo_recipe_bootstrap_candidate(base, recipes, attempts)
+        return candidate, mode
+
     def _bootstrap_bimo_initial_archive(self, max_attempts=None):
         target_archive_size = int(max(1, getattr(self, "bimo_archive_bootstrap_size", 32) or 32))
         pool_target = int(max(1, getattr(self, "bimo_candidate_pool_bootstrap_target", target_archive_size) or target_archive_size))
@@ -3103,6 +3202,7 @@ class ELP(MO4ELP):
         pool_inserted = 0
         best_candidate = self._light_clone_solution(self.s)
         best_score = math.inf
+        feasible_seed_bootstrap_used = False
 
         initial_pool_before = self._bimo_candidate_pool_size()
         if self._observe_bimo_bootstrap_candidate(best_candidate):
@@ -3114,29 +3214,56 @@ class ELP(MO4ELP):
             ):
                 pool_inserted += 1
 
+        if self._bimo_candidate_pool_size() <= initial_pool_before:
+            feasible_seed_bootstrap_used = True
+            archive_before_feasible_seed = len(getattr(self, "pareto_archive", []) or [])
+            pool_before_feasible_seed = self._bimo_candidate_pool_size()
+            if super()._bootstrap_feasible_archive(max_attempts=max_total_attempts):
+                best_candidate = self._light_clone_solution(self.s)
+                self._evaluate_solution(best_candidate)
+                if bool(getattr(best_candidate, "current_is_feasible", False)):
+                    best_score = self._bimo_candidate_score(best_candidate)
+                    archive_after_feasible_seed = len(getattr(self, "pareto_archive", []) or [])
+                    pool_after_feasible_seed = self._bimo_candidate_pool_size()
+                    inserted_count += max(0, archive_after_feasible_seed - archive_before_feasible_seed)
+                    pool_inserted += max(0, pool_after_feasible_seed - pool_before_feasible_seed)
+                    if self._observe_bimo_candidate_pool(best_candidate, source="bootstrap_feasible_seed"):
+                        pool_inserted += 1
+
         recipes = list(getattr(self, "bootstrap_recipes", []) or [])
         if not recipes:
             recipes = [getattr(self, "light_restart_recipe", []), getattr(self, "diversify_recipe", [])]
         recipes = [list(recipe) for recipe in recipes if recipe is not None]
         restart_interval = max(1, len(recipes) + 1)
+        objective_bootstrap_enabled = bool(getattr(self, "bimo_objective_bootstrap_enabled", True))
+        bootstrap_mode_counts = {}
 
         # 终止条件：候选池达到目标（同时 Pareto archive 也会随之增长）
         while self._bimo_candidate_pool_size() < pool_target and attempts < max_total_attempts:
             attempts += 1
-            if attempts % restart_interval == 0:
-                candidate = copy.deepcopy(self.env)
-                candidate.reset()
-                self._evaluate_solution(candidate)
-            else:
-                base_candidates = self._bimo_anchor_candidate_pool(
-                    include_archive=True, include_candidate_pool=True
+            if objective_bootstrap_enabled:
+                candidate, bootstrap_mode = self._generate_bimo_objective_bootstrap_candidate(
+                    best_candidate,
+                    recipes,
+                    attempts,
                 )
-                if base_candidates:
-                    base = base_candidates[int(np.random.randint(0, len(base_candidates)))]
+            else:
+                if attempts % restart_interval == 0:
+                    candidate = copy.deepcopy(self.env)
+                    candidate.reset()
+                    self._evaluate_solution(candidate)
+                    bootstrap_mode = "restart"
                 else:
-                    base = best_candidate
-                recipe = recipes[(attempts - 1) % len(recipes)] if recipes else []
-                candidate = self._generate_candidate_by_recipe(base, recipe)
+                    base_candidates = self._bimo_anchor_candidate_pool(
+                        include_archive=True, include_candidate_pool=True
+                    )
+                    if base_candidates:
+                        base = base_candidates[int(np.random.randint(0, len(base_candidates)))]
+                    else:
+                        base = best_candidate
+                    candidate, bootstrap_mode = self._generate_bimo_recipe_bootstrap_candidate(base, recipes, attempts)
+
+            bootstrap_mode_counts[bootstrap_mode] = int(bootstrap_mode_counts.get(bootstrap_mode, 0) or 0) + 1
 
             candidate_score = self._bimo_candidate_score(candidate)
             if candidate_score < best_score:
@@ -3172,6 +3299,10 @@ class ELP(MO4ELP):
             maxAttempts=int(max_total_attempts),
             insertedCount=int(inserted_count),
             candidatePoolInsertedCount=int(pool_inserted),
+            feasibleSeedBootstrapUsed=bool(feasible_seed_bootstrap_used),
+            objectiveBootstrapEnabled=bool(objective_bootstrap_enabled),
+            bootstrapModeCounts=dict(sorted(bootstrap_mode_counts.items())),
+            bootstrapCrAttempts=int(bootstrap_mode_counts.get("cr", 0) or 0),
             archiveSize=int(len(getattr(self, "pareto_archive", []) or [])),
             candidatePoolSize=self._bimo_candidate_pool_size(),
             success=bool(self.pareto_archive),
